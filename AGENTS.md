@@ -695,6 +695,101 @@ contributor skill PRs.
 
 ---
 
+## Context-Mode MCP Tools
+
+The `context-mode` MCP server provides high-context-efficiency alternatives
+to raw Bash for any command producing >20 lines of output. It runs code in
+a sandboxed subprocess (Bun/Node.js or Python) and only returns stdout to
+context — the full output stays in the subprocess.
+
+**Mandatory rule:** default to context-mode for ALL commands except the
+Bash whitelist (`mkdir`, `mv`, `cp`, `rm`, `git add/commit/push`,
+`cd`, `pwd`, `which`, `kill`, `echo`). Everything else → `ctx_execute`
+or `ctx_batch_execute`.
+
+| Tool | When to use |
+|------|-------------|
+| `ctx_execute` | Run any command that might produce >20 lines. JS/TS runs 3-5× faster than Python via Bun. |
+| `ctx_batch_execute` | Run 3-8 commands in parallel (I/O-bound: `gh` calls, `curl` fetches) with auto-indexing + BM25 search. **Replaces 30+ sequential tool calls.** |
+| `ctx_execute_file` | Read a file and process it in sandbox without loading into context. Think-in-code pattern: write analysis code, `console.log()` only the answer. |
+| `ctx_fetch_and_index` | Fetch URL → HTML→MD → FTS5 index. Returns ~3 KB preview; full content searchable via `ctx_search`. Use for docs, changelogs, API references. |
+| `ctx_index` | Index markdown/text content or a file path into the FTS5 knowledge base. Use `path:` for files (server-side read, zero context). Use `content:` only for small inline text. |
+| `ctx_search` | Search the indexed knowledge base. Batch ALL queries in ONE call. Use `source:` to scope to a specific doc. |
+| `ctx_stats` | Read-only stats on context consumption this session. |
+| `ctx_purge` | Destructive — permanently deletes indexed content. Use `session_id` for per-session, `scope: "project"` for full wipe. |
+| `ctx_doctor` | Diagnose context-mode installation (runtimes, hooks, FTS5). |
+
+### Key patterns
+
+- **Think in code:** When analyzing/counting/filtering data, write JS/Python that processes it and `console.log()` only the answer. Don't pull raw output into context.
+- **Batch parallel I/O:** `ctx_batch_execute` with `concurrency: 4-8` for multi-URL fetches, multi-repo reads, multi-API calls.
+- **File analysis pipeline:** `ctx_index(path: "/tmp/output.txt")` → `ctx_search(queries: ["error pattern", "timing"])` instead of reading the whole file.
+- **Anti-pattern:** Never pass large output to `ctx_index(content: ...)`. Use `ctx_index(path: ...)` to read server-side. Never `cat` a large file — use `ctx_execute_file`.
+
+---
+
+## Kapy CLI Extensions
+
+[Kapy](https://github.com/Moikapy/kapy) is the extensible CLI framework for
+managing the Pi and local infrastructure. Extensions are TypeScript packages
+using Bun, installed under `~/code/oykapy/`.
+
+### Quick reference
+
+```bash
+# Install kapy globally
+bun install -g ~/code/kapy/packages/kapy
+
+# Scaffold a new extension
+kapy init kapy-<name>
+
+# Build + install locally
+cd kapy-<name> && bun install && bun run build && kapy install .
+
+# Sync to Pi and install
+kapy pi:deploy --ext=kapy-<name>
+```
+
+### Extension structure
+
+```
+kapy-<name>/
+  package.json        # name: @oykapy/kapy-<name>, main: "./dist/index.js"
+  tsconfig.json       # target ESNext, module ESNext, moduleResolution bundler
+  src/index.ts         # exports register(api) + meta
+  kapy.config.ts      # optional: defineConfig
+```
+
+### Key API surface (`KapyExtensionAPI`)
+
+- `api.declareConfig({ key: { type, required, default, description } })` — auto-namespaced config
+- `api.addCommand({ name, options, agentHints, handler })` — the ONLY way to register commands
+- **NOT** `api.registerCommand(...)` — that method does NOT exist (runtime error)
+- CommandDefinition object form: `{ name, options: { description, args, flags }, agentHints, handler }`
+
+### Critical pitfalls
+
+- **`ctx.json` is a BOOLEAN, not a function.** Check `if (ctx.json)` then `console.log(JSON.stringify(data))`. Never `ctx.json(data)`.
+- **`ctx.args` has named positional args** (v0.4.0+). Declaring `args: [{ name: "env" }]` → `ctx.args.env`, NOT `ctx.args.rest[0]`.
+- **Config is auto-namespaced.** `declareConfig({ apiKey })` in `kapy-moltbook` → `ctx.config.moltbook.apiKey`.
+- **No hyphens after the namespace in command names.** `pi:boot-check` works, but `pi:sops-unlock` fails at runtime — use `pi:unlock`.
+- **`--flag=value` syntax required.** Space-separated flags get mis-parsed: always `kapy ext:cmd --service=ollama`.
+- **Hex values in `kapy config set` get corrupted.** Write `~/.kapy/config.json` directly for wallet addresses, private keys, or any hex/numeric-looking strings.
+- **Extensions installed via `file:` paths don't get config namespace injection.** Use the `getConf()` fallback helper that reads `~/.kapy/config.json` directly.
+- **SSH quoting is fragile.** Write files locally first (via `write_file`), then `scp` them to the remote host — never nest multi-line code through `ssh host "command"`.
+- **Bun on Pi is at `~/.bun/bin/bun`.** Always `export PATH=~/.bun/bin:$PATH` before `bun` or `kapy` commands over SSH.
+
+### agentHints (required for AI agent integration)
+
+Every `addCommand()` call must include `agentHints`:
+- **purpose**: Why an agent would call this command
+- **when**: Trigger conditions
+- **output**: JSON response shape
+- **sideEffects**: Any mutations, or `"None (read-only)"`
+- **requires**: Mandatory args
+
+---
+
 ## Toolsets
 
 All toolsets are defined in `toolsets.py` as a single `TOOLSETS` dict.

@@ -2339,3 +2339,84 @@ class TestPtyWebSocket:
             ):
                 pass
         assert exc.value.code == 4400
+
+
+@skip_on_windows
+class TestPwaStaticFiles:
+    """Tests for PWA static file serving (manifest, service worker, icons).
+
+    PWA files are served via dedicated routes with correct MIME types and
+    caching headers so that browsers can install the dashboard as a
+    standalone app.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_cli.web_server as ws
+
+        self.ws_module = ws
+        self.client = TestClient(ws.app)
+
+    def test_manifest_json_served(self):
+        """manifest.json should be served with the correct MIME type."""
+        resp = self.client.get("/manifest.json")
+        # If the file exists in web_dist it should be 200; otherwise 404.
+        # Either way, the route must exist (not 4xx auth redirect).
+        if resp.status_code == 200:
+            assert resp.headers["content-type"].startswith("application/manifest+json")
+            assert resp.headers.get("cache-control") == "no-cache"
+        else:
+            assert resp.status_code == 404
+
+    def test_sw_js_served(self):
+        """sw.js should be served with the correct MIME type and SW header."""
+        resp = self.client.get("/sw.js")
+        if resp.status_code == 200:
+            assert resp.headers["content-type"].startswith("application/javascript")
+            assert resp.headers.get("service-worker-allowed") == "/"
+            assert resp.headers.get("cache-control") == "no-cache"
+        else:
+            assert resp.status_code == 404
+
+    def test_pwa_routes_require_no_auth(self):
+        """PWA static files are public — they must not require a session token."""
+        # All these routes are outside /api/ so auth middleware skips them.
+        for path in ("/manifest.json", "/sw.js"):
+            resp = self.client.get(path)
+            # Must not redirect or return 401/403 — any 2xx/4xx that isn't
+            # auth-related is fine (404 if file doesn't exist in CI).
+            assert resp.status_code in (200, 404)
+
+    def test_manifest_json_content(self):
+        """If manifest.json is present, it must be valid JSON with PWA fields."""
+        resp = self.client.get("/manifest.json")
+        if resp.status_code != 200:
+            pytest.skip("manifest.json not built into web_dist")
+
+        data = resp.json()
+        # Required PWA manifest fields per W3C spec.
+        assert "name" in data
+        assert "short_name" in data
+        assert "start_url" in data
+        assert "display" in data
+        assert "icons" in data
+        assert isinstance(data["icons"], list)
+        assert len(data["icons"]) > 0
+        # Each icon must have src and sizes.
+        for icon in data["icons"]:
+            assert "src" in icon
+            assert "sizes" in icon
+
+    def test_sw_js_is_javascript(self):
+        """If sw.js is present, it must be JavaScript content."""
+        resp = self.client.get("/sw.js")
+        if resp.status_code != 200:
+            pytest.skip("sw.js not built into web_dist")
+
+        body = resp.text
+        assert "addEventListener" in body or "self.addEventListener" in body

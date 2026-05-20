@@ -8,9 +8,27 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
     <title>Hermes Agent - Dashboard</title>
+
+    <!-- PWA manifest -->
+    <link rel="manifest" href="/manifest.json" />
+    <!-- PWA meta tags -->
+    <meta name="theme-color" content="#6d28d9" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Hermes" />
+    <link rel="apple-touch-icon" href="/icons/icon-152x152.png" />
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <!-- PWA service worker registration -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch(() => {});
+        });
+      }
+    </script>
   </body>
 </html>

@@ -3726,6 +3726,42 @@ def mount_spa(application: FastAPI):
 
     application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
 
+    # --- PWA static files (manifest, service worker, icons) ---
+    @application.get("/manifest.json")
+    async def serve_manifest():
+        manifest_path = WEB_DIST / "manifest.json"
+        if manifest_path.is_file():
+            return Response(
+                content=manifest_path.read_bytes(),
+                media_type="application/manifest+json",
+                headers={"Cache-Control": "no-cache"},
+            )
+        return JSONResponse({"error": "manifest.json not found"}, status_code=404)
+
+    @application.get("/sw.js")
+    async def serve_service_worker():
+        sw_path = WEB_DIST / "sw.js"
+        if sw_path.is_file():
+            return Response(
+                content=sw_path.read_bytes(),
+                media_type="application/javascript",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Service-Worker-Allowed": "/",
+                },
+            )
+        return JSONResponse({"error": "sw.js not found"}, status_code=404)
+
+    application.mount(
+        "/icons", StaticFiles(directory=WEB_DIST / "icons"), name="pwa_icons"
+    )
+
+    # PWA file overrides — served with correct MIME types and caching headers.
+    _PWA_MIME_TYPES = {
+        "manifest.json": ("application/manifest+json", "no-cache"),
+        "sw.js": ("application/javascript", "no-cache"),
+    }
+
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
@@ -3737,6 +3773,17 @@ def mount_spa(application: FastAPI):
             and file_path.exists()
             and file_path.is_file()
         ):
+            # Serve PWA files with precise content types and caching.
+            if full_path in _PWA_MIME_TYPES:
+                mime, cache = _PWA_MIME_TYPES[full_path]
+                headers = {"Cache-Control": cache}
+                if full_path == "sw.js":
+                    headers["Service-Worker-Allowed"] = "/"
+                return Response(
+                    content=file_path.read_bytes(),
+                    media_type=mime,
+                    headers=headers,
+                )
             return FileResponse(file_path)
         return _serve_index(prefix)
 

@@ -3372,6 +3372,13 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     if not host or not port:
         return None
 
+    # 0.0.0.0 and :: are valid bind addresses but NOT valid connect targets.
+    # Replace with loopback so the PTY child can actually reach the server.
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+
     netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
     qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
 

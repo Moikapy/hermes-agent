@@ -2340,6 +2340,83 @@ class TestPtyWebSocket:
                 pass
         assert exc.value.code == 4400
 
+@skip_on_windows
+class TestBuildSidecarUrl:
+    """Tests for _build_sidecar_url — the function that generates the
+    HERMES_TUI_SIDECAR_URL env var for PTY child processes.
+
+    Key invariant: 0.0.0.0 and :: are valid *bind* addresses but NOT valid
+    *connect* targets.  When the dashboard binds to all interfaces (via
+    --insecure), the sidecar URL must use the loopback address so the PTY
+    child can actually reach the server.
+    """
+
+    def _call(self, host, port, channel="test-ch"):
+        """Call _build_sidecar_url with the given host/port and a fresh app.state."""
+        from hermes_cli.web_server import app, _build_sidecar_url
+
+        app.state.bound_host = host
+        app.state.bound_port = port
+        return _build_sidecar_url(channel)
+
+    def test_localhost_unchanged(self):
+        """127.0.0.1 should pass through unchanged."""
+        url = self._call("127.0.0.1", 9119)
+        assert url is not None
+        assert url.startswith("ws://127.0.0.1:9119/api/pub?")
+
+    def test_custom_host_unchanged(self):
+        """A custom hostname should pass through unchanged."""
+        url = self._call("my-server.local", 9119)
+        assert url is not None
+        assert url.startswith("ws://my-server.local:9119/api/pub?")
+
+    def test_zero_bind_replaced_with_loopback(self):
+        """0.0.0.0 must be replaced with 127.0.0.1 so the PTY child can connect."""
+        url = self._call("0.0.0.0", 9119)
+        assert url is not None
+        assert url.startswith("ws://127.0.0.1:9119/api/pub?")
+        assert "0.0.0.0" not in url
+
+    def test_ipv6_any_replaced_with_loopback(self):
+        """:: (IPv6 any) must be replaced with ::1 so the PTY child can connect."""
+        url = self._call("::", 9119)
+        assert url is not None
+        assert url.startswith("ws://[::1]:9119/api/pub?")
+        # Ensure the original :: didn't leak into the netloc
+        assert "://" not in url.split("//")[1]
+
+    def test_ipv6_loopback_bracketed(self):
+        """::1 should be bracketed correctly in the URL."""
+        url = self._call("::1", 9119)
+        assert url is not None
+        assert url.startswith("ws://[::1]:9119/api/pub?")
+
+    def test_returns_none_when_host_missing(self):
+        """If bound_host is not set, return None (no sidecar URL)."""
+        from hermes_cli.web_server import app, _build_sidecar_url
+
+        if hasattr(app.state, "bound_host"):
+            delattr(app.state, "bound_host")
+        result = _build_sidecar_url("test-ch")
+        assert result is None
+
+    def test_returns_none_when_port_missing(self):
+        """If bound_port is not set, return None (no sidecar URL)."""
+        from hermes_cli.web_server import app, _build_sidecar_url
+
+        app.state.bound_host = "127.0.0.1"
+        if hasattr(app.state, "bound_port"):
+            delattr(app.state, "bound_port")
+        result = _build_sidecar_url("test-ch")
+        assert result is None
+
+    def test_channel_and_token_in_url(self):
+        """The URL must include both the channel and session token."""
+        url = self._call("127.0.0.1", 9119, channel="abc-123")
+        assert "channel=abc-123" in url
+        assert "token=" in url
+
 
 @skip_on_windows
 class TestPwaStaticFiles:

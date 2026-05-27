@@ -1,0 +1,7 @@
+name: magic_link
+version: 1.0.0
+description: "Dashboard auth provider — magic link email authentication. Auto-activates when HERMES_DASHBOARD_MAGIC_LINK_ENABLED is set. Verifies sessions via the SQLite sessions table managed by hermes_cli.user_auth."
+author: OYKAPY
+kind: backend
+requires_env:
+  - HERMES_DASHBOARD_MAGIC_LINK_ENABLED

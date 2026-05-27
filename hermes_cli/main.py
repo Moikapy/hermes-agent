@@ -11490,11 +11490,11 @@ def main():
     # =========================================================================
     secrets_parser = subparsers.add_parser(
         "secrets",
-        help="Manage external secret sources (Bitwarden Secrets Manager)",
+        help="Manage secrets (Bitwarden, SOPS)",
         description=(
-            "Pull API keys from an external secret manager at process startup "
-            "instead of storing them in ~/.hermes/.env.  Currently supports "
-            "Bitwarden Secrets Manager.  See: "
+            "Manage API keys and secrets across profiles and deployment targets. "
+            "Supports Bitwarden Secrets Manager and SOPS (age-encrypted). "
+            "See: "
             "https://hermes-agent.nousresearch.com/docs/user-guide/secrets/bitwarden"
         ),
     )
@@ -11506,15 +11506,25 @@ def main():
         help="Bitwarden Secrets Manager integration",
     )
 
+    secrets_sops = secrets_subparsers.add_parser(
+        "sops",
+        help="SOPS-encrypted secrets management (age + SOPS)",
+    )
+
     # Lazy import — only pays for itself when this subcommand is actually used.
     from hermes_cli import secrets_cli as _secrets_cli
+    from hermes_cli import secrets_sops as _secrets_sops
 
     _secrets_cli.register_cli(secrets_bw)
+    _secrets_sops.register_cli(secrets_sops)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
+        sops_sub = getattr(args, "sops_command", None)
         if sub in ("bitwarden", "bw") and bw_sub is not None:
+            return args.func(args)
+        if sub == "sops" and sops_sub is not None:
             return args.func(args)
         secrets_parser.print_help()
         return 0

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 from typing import Optional
 
 from hermes_cli.dashboard_auth import (
@@ -57,10 +58,11 @@ from hermes_cli.dashboard_auth import (
     Session,
 )
 from hermes_cli.user_auth import (
-    get_session_user,
-    delete_session,
-    get_user_by_id,
+    DASHBOARD_PROFILE_DIR,
     SESSION_TTL_SECONDS,
+    delete_session,
+    get_session_user,
+    get_user_by_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,6 +190,67 @@ class MagicLinkAuthProvider(DashboardAuthProvider):
         except Exception as exc:
             # Best-effort — must not raise per provider contract
             logger.warning("magic_link: failed to revoke session: %s", exc)
+
+    def create_session(
+        self,
+        *,
+        user_id: str,
+        email: str,
+        display_name: str = "",
+        role: str = "user",
+        ttl_seconds: int = 86400,
+    ) -> Session:
+        """Create a new session in SQLite and return a ``Session`` dataclass.
+
+        Called by the ``/api/auth/verify`` route when a magic link token is
+        successfully validated, and potentially by other auth flows that
+        need to create a dashboard session programmatically.
+
+        Generates a fresh session_id using :func:`secrets.token_urlsafe`,
+        inserts a row into the ``sessions`` table, and returns a fully
+        populated :class:`Session` with the generated access token.
+
+        Args:
+            user_id: Stable user identifier (e.g. UUID or email hash).
+            email: User's email address, stored in the Session for claims.
+            display_name: Human-readable name used by the UI.
+            role: RBAC role string (``root``, ``admin``, ``fam``, ``user``).
+            ttl_seconds: Session lifetime in seconds (default: 86400 = 24h).
+
+        Returns:
+            A populated :class:`Session` with the generated ``access_token``
+            (which doubles as the session_id in the cookie).
+        """
+        import secrets
+        import time
+
+        session_id = secrets.token_urlsafe(32)
+        now = int(time.time())
+        expires_at = now + ttl_seconds
+
+        conn = sqlite3.connect(str(DASHBOARD_PROFILE_DIR / "users.db"))
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                "INSERT INTO sessions (session_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (session_id, user_id, now, expires_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return Session(
+            user_id=user_id,
+            email=email,
+            display_name=display_name,
+            org_id="",
+            provider=self.name,
+            expires_at=expires_at,
+            access_token=session_id,
+            refresh_token="",
+        )
 
 
 # ---------------------------------------------------------------------------

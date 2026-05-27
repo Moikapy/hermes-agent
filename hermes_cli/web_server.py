@@ -10752,6 +10752,98 @@ def mount_spa(application: FastAPI):
 
 
 # ---------------------------------------------------------------------------
+# Secrets (SOPS) endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/secrets")
+async def api_secrets_list(request: Request):
+    """List secret key names, targets, and sync status — never values."""
+    if not _has_valid_session_token(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        from hermes_cli.secrets_sops import _secrets_file, _sops_decrypt, _collect_secret_keys, _get_nested
+        from hermes_cli.secrets_sops import _status_env_file, _status_wrangler_vars, _status_wrangler_secret_target
+    except ImportError:
+        raise HTTPException(status_code=503, detail="SOPS plugin not available")
+
+    profile = request.query_params.get("profile")
+    secrets_path = _secrets_file(profile)
+    if not secrets_path.exists():
+        return {"secrets": [], "profile": profile}
+
+    try:
+        data = _sops_decrypt(secrets_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to decrypt: {exc}")
+
+    secret_keys = _collect_secret_keys(data)
+    results = []
+    for key_path in secret_keys:
+        entry = _get_nested(data, key_path)
+        targets = entry.get("targets", []) if isinstance(entry, dict) else []
+        target_status = []
+        for t in targets:
+            ttype = t["type"]
+            tpath = Path(os.path.expanduser(t["path"]))
+            tkey = t["key"]
+            value = str(entry["value"]) if isinstance(entry, dict) and "value" in entry else ""
+            if ttype == "wrangler_vars":
+                state, _ = _status_wrangler_vars(tpath, tkey, value)
+            elif ttype in ("dev_vars", "hermes_env"):
+                state, _ = _status_env_file(tpath, tkey, value)
+            elif ttype == "wrangler_secrets":
+                state, _ = _status_wrangler_secret_target(tpath, tkey, value)
+            else:
+                state = "unknown"
+            target_status.append({"type": ttype, "path": str(tpath), "key": tkey, "status": state})
+        results.append({
+            "key": key_path,
+            "targets": target_status,
+            "last_rotated": entry.get("last_rotated") if isinstance(entry, dict) else None,
+            "notes": entry.get("notes") if isinstance(entry, dict) else None,
+        })
+    return {"secrets": results, "profile": profile}
+
+
+@app.post("/api/secrets/sync")
+async def api_secrets_sync(request: Request):
+    """Sync all secrets to their target files."""
+    if not _has_valid_session_token(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    import subprocess
+    profile = request.query_params.get("profile")
+    target = request.query_params.get("target")
+    cmd = ["sops", "sync"]
+    if profile:
+        cmd.extend(["--profile", profile])
+    if target:
+        cmd.extend(["--target", target])
+    # Delegate to hermes CLI for safety
+    result = subprocess.run(
+        ["hermes", "secrets", "sops", "sync"] + (["--profile", profile] if profile else []) + (["--target", target] if target else []),
+        capture_output=True, text=True, timeout=120,
+    )
+    return {"status": "ok" if result.returncode == 0 else "error", "output": result.stdout or result.stderr}
+
+
+@app.post("/api/secrets/rotate/{key:path}")
+async def api_secrets_rotate(key: str, request: Request):
+    """Rotate a secret key — generate new value and sync targets."""
+    if not _has_valid_session_token(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    length = body.get("length", 32)
+    profile = body.get("profile") or request.query_params.get("profile")
+
+    import subprocess
+    cmd = ["hermes", "secrets", "sops", "rotate", key, "--length", str(length)]
+    if profile:
+        cmd.extend(["--profile", profile])
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return {"status": "ok" if result.returncode == 0 else "error", "output": result.stdout or result.stderr}
+
+
+# ---------------------------------------------------------------------------
 # Dashboard theme endpoints
 # ---------------------------------------------------------------------------
 

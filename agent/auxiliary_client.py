@@ -1369,7 +1369,7 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     try:
         from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
-        creds = resolve_xai_oauth_runtime_credentials()
+        creds = resolve_xai_oauth_runtime_credentials(force_refresh=True)
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)
         return None

@@ -11520,11 +11520,13 @@ def main():
     from hermes_cli import secrets_sops as _secrets_sops
     from hermes_cli import secrets_health as _secrets_health
     from hermes_cli import secrets_registry as _secrets_registry
+    from hermes_cli import secrets_verify as _secrets_verify
 
     _secrets_cli.register_cli(secrets_bw)
     _secrets_sops.register_cli(secrets_sops)
     _secrets_health.register_cli(secrets_subparsers)
     _secrets_registry.register_cli(secrets_subparsers)
+    _secrets_verify.register_cli(secrets_subparsers)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
@@ -11534,9 +11536,7 @@ def main():
             return args.func(args)
         if sub == "sops" and sops_sub is not None:
             return args.func(args)
-        if sub == "check":
-            return args.func(args)
-        if sub == "status":
+        if sub in ("check", "status", "verify"):
             return args.func(args)
         secrets_parser.print_help()
         return 0

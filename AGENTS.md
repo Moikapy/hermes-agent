@@ -1181,6 +1181,34 @@ automatically scope to the active profile.
    This is intentional — it lets `hermes -p coder profile list` see all profiles regardless
    of which one is active.
 
+### Profile rotation resilience
+
+Profile directories under `~/.hermes/profiles/` are renamed periodically (every few weeks)
+for privacy and multi-user handoffs. Two mechanisms make this safe:
+
+1. **`_ensure_external_dirs(profile_dir)`** in `hermes_cli/profiles.py` is called at the end
+   of `rename_profile()` and inside `create_profile()`. It reads the global
+   `~/.hermes/config.yaml` `skills.external_dirs` and merges them into the profile's
+   `config.yaml` when missing or empty. Profiles with a non-empty `external_dirs` are left
+   alone (deliberate opt-out preserved). This means `hermes -p <newname> skills list`
+   automatically shows the same shared skills (kanban-task-authoring, research-paper-writing,
+   etc.) after a rename or fresh create — no manual config edit required.
+
+2. **`hermes kanban migrate-assignee <old> <new>`** rewrites stranded tasks after a
+   rename. Backed by `kanban_db.migrate_assignee()` — defaults to
+   `ready`/`todo`/`blocked` only, emits a `migrated` event per row, never touches
+   `running` (claim must be reclaimed first), and supports `--include-done`,
+   `--include-archived`, `--include-running`, `--reason`, `--json` flags.
+
+If a task body says "assigned to sund" but `sund` no longer exists, the dispatcher
+silently skips it as a non-spawnable assignee. Run `migrate-assignee` after any
+profile rename to keep the queue flow:
+
+```bash
+hermes profile rename sund the_developer
+hermes kanban migrate-assignee sund the_developer
+```
+
 ## Known Pitfalls
 
 ### DO NOT hardcode `~/.hermes` paths

@@ -96,6 +96,7 @@ class MagicLinkAuthProvider(DashboardAuthProvider):
 
     name = "magic_link"
     display_name = "Email (Magic Link)"
+    flow_type = "magic_link"
 
     def start_login(self, *, redirect_uri: str) -> LoginStart:
         """Not implemented — magic link uses POST /api/auth/magic-link, not OAuth redirect."""

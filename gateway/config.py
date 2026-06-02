@@ -1623,6 +1623,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             thread_id=os.getenv("EMAIL_HOME_ADDRESS_THREAD_ID") or None,
         )
 
+    # Hybrid email ingest (Cloudflare Worker + R2 + /api/email-ingest push)
+    # Enable a stub EMAIL platform so the adapter (and its _pending_messages queue)
+    # exists even when classic IMAP creds are not present.
+    try:
+        from hermes_cli.config import cfg_get
+        wi = cfg_get("email.worker_ingest", {}) or {}
+        if wi.get("enabled") and wi.get("ingest_token"):
+            if Platform.EMAIL not in config.platforms:
+                config.platforms[Platform.EMAIL] = PlatformConfig()
+            config.platforms[Platform.EMAIL].enabled = True
+            config.platforms[Platform.EMAIL].extra.setdefault("hybrid_ingest_only", True)
+            logger.info("[gateway-config] EMAIL platform enabled for hybrid ingest (worker_ingest)")
+    except Exception as e:
+        logger.debug(f"hybrid email platform enable skipped: {e}")
+
     # SMS (Twilio)
     twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
     if twilio_sid:

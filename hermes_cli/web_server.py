@@ -2189,6 +2189,76 @@ async def update_hermes():
         "name": "hermes-update",
     }
 
+@app.post("/api/email-ingest")
+async def email_ingest(request: Request):
+    """
+    Receive structured email payloads from the Hermes Email Hybrid Worker
+    (Cloudflare Worker + R2 archival).
+
+    Protected ONLY by the long-lived Bearer token (no dashboard session token required).
+    This is intentional — the Worker runs outside the Hermes dashboard auth model.
+
+    The actual logic lives in the optional `email-ingest` plugin so the core
+    remains clean and the feature can be completely disabled.
+    """
+    # Extract Bearer token (support "Bearer xxx" or bare token)
+    auth_header = request.headers.get("Authorization", "") or request.headers.get("authorization", "")
+    bearer_token = None
+    if auth_header.lower().startswith("bearer "):
+        bearer_token = auth_header[7:].strip()
+    elif auth_header:
+        bearer_token = auth_header.strip()
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Dynamically load the plugin receiver (optional plugin — no hard dependency)
+    try:
+        import importlib.util
+        from pathlib import Path as _Path
+
+        plugin_dir = _Path.home() / ".hermes" / "plugins" / "email-ingest"
+        init_file = plugin_dir / "__init__.py"
+
+        if not init_file.exists():
+            _log.warning("email-ingest plugin not installed — dropping payload (R2 archival continues)")
+            return JSONResponse(
+                status_code=202,
+                content={"status": "ignored", "reason": "plugin_not_installed"}
+            )
+
+        spec = importlib.util.spec_from_file_location(
+            "email_ingest",
+            init_file,
+            submodule_search_locations=[str(plugin_dir)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        mod.__package__ = "email_ingest"
+        spec.loader.exec_module(mod)
+
+        receiver = getattr(mod, "handle_email_ingest", None)
+        if receiver is None:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "reason": "no_receiver_in_plugin"}
+            )
+
+        # The receiver is async
+        result = await receiver(payload, bearer_token)
+        status_code = 200 if result.get("status") in ("accepted", "archived_only", "ignored") else 401 if result.get("status") == "unauthorized" else 202
+        return JSONResponse(status_code=status_code, content=result)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("email-ingest endpoint failed")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "reason": "internal_error", "detail": str(exc)}
+        )
+
 
 def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
     """Commits the local checkout is behind ``origin/main`` by, newest first.
@@ -11694,6 +11764,7 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
         ".ttf": "font/ttf",
         ".otf": "font/otf",
         ".map": "application/json",
+        ".webmanifest": "application/manifest+json",
     }
     if suffix not in content_types:
         raise HTTPException(

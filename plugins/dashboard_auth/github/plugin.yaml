@@ -1,0 +1,7 @@
+name: github
+version: 1.0.0
+description: "Dashboard auth provider — OAuth 2.0 against GitHub. Auto-activates when HERMES_DASHBOARD_GITHUB_CLIENT_ID and HERMES_DASHBOARD_GITHUB_CLIENT_SECRET are set. Set HERMES_DASHBOARD_ALLOWED_EMAILS to restrict access."
+author: Moikas
+kind: backend
+requires_env:
+  - HERMES_DASHBOARD_GITHUB_CLIENT_ID

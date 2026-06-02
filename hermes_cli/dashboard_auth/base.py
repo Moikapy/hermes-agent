@@ -76,17 +76,23 @@ class DashboardAuthProvider(ABC):
     """Protocol every dashboard-auth provider plugin implements.
 
     Lifecycle:
-      1. ``start_login`` — user clicks "Log in with X" on the login page.
-         Provider returns a redirect URL and any PKCE/CSRF state to stash
-         in short-lived cookies.
-      2. Browser bounces through the OAuth IDP and lands at /auth/callback.
-      3. ``complete_login`` — exchange the code + verifier for a Session.
-      4. ``verify_session`` — called on every request to validate the
-         access token in the cookie. Returns ``None`` if the token is
-         expired or invalid (middleware then triggers refresh or logout).
-      5. ``refresh_session`` — called when the access token is near expiry.
-         Returns a new Session with rotated tokens.
-      6. ``revoke_session`` — called on /auth/logout. Best-effort.
+      * OAuth providers:
+        1. ``start_login`` — user clicks "Log in with X" on the login page.
+           Provider returns a redirect URL and any PKCE/CSRF state to stash
+           in short-lived cookies.
+        2. Browser bounces through the OAuth IDP and lands at /auth/callback.
+        3. ``complete_login`` — exchange the code + verifier for a Session.
+      * Magic link providers:
+        1. User submits email via POST /api/auth/magic-link.
+        2. Email containing a verification link is sent to the user.
+        3. User clicks the link → GET /api/auth/verify?token=… → session created.
+      * Both flows share:
+        4. ``verify_session`` — called on every request to validate the
+           access token in the cookie. Returns ``None`` if the token is
+           expired or invalid (middleware then triggers refresh or logout).
+        5. ``refresh_session`` — called when the access token is near expiry.
+           Returns a new Session with rotated tokens.
+        6. ``revoke_session`` — called on /auth/logout. Best-effort.
 
     Failure semantics:
       * ``start_login`` may raise ``ProviderError`` if the IDP is
@@ -118,10 +124,13 @@ class DashboardAuthProvider(ABC):
       ``complete_login``) remain abstract; a pure-password provider that
       will never be reached via the redirect flow may implement them as
       stubs that raise ``NotImplementedError``.
-    """
+    Set ``flow_type = "magic_link"`` for providers that use email-based
+    magic links instead of OAuth redirects. The login page renders an
+    email input form for these providers and skips the OAuth round trip.    """
 
     name: str = ""
     display_name: str = ""
+    flow_type: str = "oauth"  # "oauth" or "magic_link"
 
     # When True, this provider authenticates via username + password
     # (``complete_password_login``) rather than (or in addition to) the

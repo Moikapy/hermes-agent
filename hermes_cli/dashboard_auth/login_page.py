@@ -184,6 +184,50 @@ _LOGIN_HTML_TEMPLATE = """\
     font-size: 0.95rem;
   }}
 
+  /* Magic link email form — stacked input + button. */
+  .magic-link-form label {{
+    display: block;
+    margin: 0 0 1.75rem .1rem;
+    color: color-mix(in srgb, var(--foreground) 85%, transparent);
+    font-size: 0.9rem;
+    font-family: 'Collapse', sans-serif;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+  }}
+
+  .magic-link-form input[type="email"] {{
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.75rem;
+    background: color-mix(in srgb, var(--foreground) 6%, var(--background-base));
+    border: 1px solid var(--hairline-strong);
+    color: var(--foreground);
+    font-family: 'Collapse', sans-serif;
+    font-size: 0.95rem;
+    outline: none;
+  }}
+  .magic-link-form input[type="email"]:focus {{
+    border-color: var(--midground);
+  }}
+  .magic-link-form input[type="email"]::placeholder {{
+    color: color-mix(in srgb, var(--foreground) 40%, transparent);
+  }}
+
+  .magic-link-status {{
+    margin: 0.5rem 0 0;
+    font-size: 0.85rem;
+    min-height: 1.2em;
+    color: color-mix(in srgb, var(--foreground) 70%, transparent);
+  }}
+  .magic-link-status.success {{
+    color: #4ade80;
+  }}
+  .magic-link-status.error {{
+    color: #f87171;
+  }}
+
   .provider-list {{
     display: grid;
     gap: 0.75rem;
@@ -225,56 +269,6 @@ _LOGIN_HTML_TEMPLATE = """\
     outline-offset: 3px;
   }}
 
-  /* Password provider form — same visual language as the OAuth buttons:
-     squared inputs, hairline borders, amber focus ring. */
-  .provider-form {{
-    display: grid;
-    gap: 0.75rem;
-    text-align: left;
-  }}
-  .form-title {{
-    font-family: 'Rules Compressed', 'Collapse', sans-serif;
-    font-weight: 600;
-    font-size: 0.72rem;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 70%, transparent);
-  }}
-  .field {{
-    display: grid;
-    gap: 0.3rem;
-  }}
-  .field-label {{
-    font-size: 0.72rem;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: color-mix(in srgb, var(--foreground) 55%, transparent);
-  }}
-  .field-input {{
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.7rem 0.8rem;
-    background: color-mix(in srgb, #000000 25%, var(--background-base));
-    color: var(--foreground);
-    border: 1px solid var(--hairline-strong);
-    border-radius: 0;
-    font-family: 'Collapse', sans-serif;
-    font-size: 0.95rem;
-  }}
-  .field-input:focus-visible {{
-    outline: none;
-    border-color: var(--midground);
-    box-shadow: 0 0 0 1px var(--midground);
-  }}
-  .form-error {{
-    color: #ff6b6b;
-    font-size: 0.82rem;
-    letter-spacing: 0.02em;
-  }}
-  .provider-form .provider-btn {{
-    margin-top: 0.25rem;
-  }}
-
   footer {{
     margin-top: 1.75rem;
     text-align: center;
@@ -314,9 +308,48 @@ _LOGIN_HTML_TEMPLATE = """\
     <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
   </footer>
 </main>
+{magic_link_js}
 {password_script}
 </body>
 </html>
+"""
+
+_MAGIC_LINK_JS = """\
+<script>
+function handleMagicLink(event, form) {
+  event.preventDefault();
+  var email = form.querySelector('input[name="email"]').value;
+  var next = form.querySelector('input[name="next"]');
+  var statusEl = form.querySelector('.magic-link-status');
+  var btn = form.querySelector('button[type="submit"]');
+  btn.disabled = true;
+  btn.textContent = 'Sending\u2026';
+  statusEl.className = 'magic-link-status';
+  statusEl.textContent = '';
+  var body = {email: email};
+  if (next && next.value) body.next = next.value;
+  fetch('/api/auth/magic-link', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r) {
+    btn.disabled = false;
+    btn.textContent = 'Send magic link';
+    if (r.ok) {
+      statusEl.className = 'magic-link-status success';
+      statusEl.textContent = 'Check your email for a sign-in link.';
+    } else {
+      statusEl.className = 'magic-link-status error';
+      statusEl.textContent = 'Something went wrong. Please try again.';
+    }
+  }).catch(function() {
+    btn.disabled = false;
+    btn.textContent = 'Send magic link';
+    statusEl.className = 'magic-link-status error';
+    statusEl.textContent = 'Network error. Please try again.';
+  });
+}
+</script>
 """
 
 _EMPTY_HTML = """\
@@ -401,60 +434,6 @@ auth gate (not recommended on untrusted networks).</p>
 """
 
 
-# Inline script that wires every password provider form to POST JSON to
-# ``/auth/password-login`` and navigate on success. Emitted ONLY when at
-# least one ``supports_password`` provider is listed (OAuth-only login
-# pages stay script-free, preserving the no-JS contract for that case).
-#
-# Plain string (NOT run through ``str.format``), so braces are literal —
-# do not double them. A single delegated submit handler covers all forms;
-# the provider name is read from the form's ``data-provider`` attribute.
-_PASSWORD_FORM_SCRIPT = """\
-<script>
-(function () {
-  function handle(form) {
-    form.addEventListener('submit', function (ev) {
-      ev.preventDefault();
-      var err = form.querySelector('.form-error');
-      var btn = form.querySelector('button[type=submit]');
-      if (err) { err.hidden = true; err.textContent = ''; }
-      if (btn) { btn.disabled = true; }
-      var body = {
-        provider: form.getAttribute('data-provider') || '',
-        username: (form.querySelector('input[name=username]') || {}).value || '',
-        password: (form.querySelector('input[name=password]') || {}).value || '',
-        next: (form.querySelector('input[name=next]') || {}).value || ''
-      };
-      fetch('/auth/password-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        credentials: 'same-origin'
-      }).then(function (resp) {
-        if (resp.ok) {
-          return resp.json().then(function (data) {
-            window.location.assign((data && data.next) || '/');
-          });
-        }
-        var msg = resp.status === 429
-          ? 'Too many attempts. Please wait and try again.'
-          : (resp.status === 401 ? 'Invalid username or password.'
-                                 : 'Sign-in failed. Please try again.');
-        if (err) { err.textContent = msg; err.hidden = false; }
-        if (btn) { btn.disabled = false; }
-      }).catch(function () {
-        if (err) { err.textContent = 'Network error. Please try again.'; err.hidden = false; }
-        if (btn) { btn.disabled = false; }
-      });
-    });
-  }
-  var forms = document.querySelectorAll('form.provider-form');
-  for (var i = 0; i < forms.length; i++) { handle(forms[i]); }
-})();
-</script>
-"""
-
-
 def render_login_html(*, next_path: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 
@@ -464,6 +443,10 @@ def render_login_html(*, next_path: str = "") -> str:
     end-to-end. The caller (``routes.login_page``) is responsible for
     validating ``next_path`` against the same-origin rules before we
     emit it; we still HTML-escape it as defence in depth.
+
+    For OAuth providers, a redirect button is rendered. For magic_link
+    providers, an email input form is rendered instead that POSTs to
+    ``/api/auth/magic-link``.
     """
     providers = list_providers()
     if not providers:
@@ -475,39 +458,69 @@ def render_login_html(*, next_path: str = "") -> str:
         # so a value that round-tripped from /login?next=... back into
         # the button href is byte-identical.
         from urllib.parse import quote
+        from urllib.parse import unquote
         next_qs = f"&next={html.escape(quote(next_path, safe=''), quote=True)}"
+        # For magic link forms, the next value goes in a hidden field
+        # so we need the raw HTML-escaped value (not URL-encoded).
+        next_hidden = html.escape(next_path)
     else:
         next_qs = ""
+        next_hidden = ""
 
     buttons = []
     needs_password_script = False
     for p in providers:
         if getattr(p, "supports_password", False):
+            # Password (non-redirect) provider — render a username/password
+            # form. The single delegated submit handler is _PASSWORD_FORM_SCRIPT
+            # (loaded once at the bottom if any provider needs it).
             needs_password_script = True
             buttons.append(_render_password_form(p, next_path))
+        if getattr(p, "flow_type", "oauth") == "magic_link":
+            # Render an email input form for magic link providers.
+            buttons.append(
+                f'      <form class="magic-link-form" method="post" '
+                f'action="/api/auth/magic-link" '
+                f'onsubmit="handleMagicLink(event, this)">'
+                f'<label for="email-{html.escape(p.name)}">'
+                f'{html.escape(p.display_name)}</label>'
+                f'<input id="email-{html.escape(p.name)}" name="email" '
+                f'type="email" required autocomplete="email" '
+                f'placeholder="you@example.com" />'
+                f'<input type="hidden" name="next" value="{next_hidden}" />'
+                f'<button type="submit" class="provider-btn">Send magic link</button>'
+                f'<p class="magic-link-status" id="status-{html.escape(p.name)}"></p>'
+                f'</form>'
+            )
         else:
             buttons.append(
                 f'      <a class="provider-btn" '
                 f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
                 f'Sign in with {html.escape(p.display_name)}</a>'
             )
-    script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
+
+    # Inject the magic link JavaScript if any provider uses magic_link.
+    magic_link_js = ""
+    if any(getattr(p, "flow_type", "oauth") == "magic_link" for p in providers):
+        magic_link_js = _MAGIC_LINK_JS
+
+    # Inject the password form submit handler if any provider needs it.
+    password_script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
+
     return _LOGIN_HTML_TEMPLATE.format(
         provider_buttons="\n".join(buttons),
-        password_script=script,
+        magic_link_js=magic_link_js,
+        password_script=password_script,
     )
 
 
 def _render_password_form(provider, next_path: str) -> str:
     """Render a username/password form for a ``supports_password`` provider.
 
-    The form is wired by :data:`_PASSWORD_FORM_SCRIPT` (a single delegated
-    submit handler) to POST JSON to ``/auth/password-login`` and navigate
-    on success. ``next_path`` is carried in a hidden field; it has already
-    been validated same-origin by the caller and is HTML-escaped here as
-    defence in depth. The provider ``name`` is emitted in a ``data-``
-    attribute (not a hidden input) so the script reads it without trusting
-    form-field ordering.
+    The form is wired by :data:`_PASSWORD_FORM_SCRIPT` to POST JSON to
+    ``/auth/password-login``. ``next_path`` is HTML-escaped and carried
+    in a hidden field. The provider ``name`` is emitted in a ``data-``
+    attribute so the script reads it without trusting form-field order.
     """
     pname = html.escape(provider.name, quote=True)
     plabel = html.escape(provider.display_name)
@@ -530,5 +543,46 @@ def _render_password_form(provider, next_path: str) -> str:
         f'        </label>\n'
         f'        <div class="form-error" role="alert" hidden></div>\n'
         f'        <button class="provider-btn" type="submit">Sign in</button>\n'
-        f'      </form>'
+        f'      </form>\n'
     )
+
+
+_PASSWORD_FORM_SCRIPT = """
+<script>
+(function() {
+  function attach() {
+    document.querySelectorAll('form.provider-form').forEach(function(form) {
+      if (form.dataset.bound === '1') return;
+      form.dataset.bound = '1';
+      form.addEventListener('submit', async function(ev) {
+        ev.preventDefault();
+        var provider = form.dataset.provider;
+        var next = (form.querySelector('input[name="next"]') || {}).value || '';
+        var username = (form.querySelector('input[name="username"]') || {}).value || '';
+        var password = (form.querySelector('input[name="password"]') || {}).value || '';
+        var errEl = form.querySelector('.form-error');
+        if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+        try {
+          var r = await fetch('/auth/password-login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            credentials: 'same-origin',
+            body: JSON.stringify({provider: provider, username: username, password: password, next: next})
+          });
+          if (r.ok) { window.location.href = next || '/'; return; }
+          var body = await r.json().catch(function() { return {}; });
+          if (errEl) { errEl.hidden = false; errEl.textContent = (body.detail || 'Invalid credentials'); }
+        } catch (e) {
+          if (errEl) { errEl.hidden = false; errEl.textContent = 'Network error'; }
+        }
+      });
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attach);
+  } else {
+    attach();
+  }
+})();
+</script>
+"""

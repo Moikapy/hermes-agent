@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import os
 import time
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, Tuple
@@ -183,6 +184,16 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             status_code=404,
             detail=f"Unknown provider: {provider!r}",
         )
+
+    # Magic link providers don't use the OAuth redirect flow — redirect
+    # back to /login which renders the email input form.
+    if getattr(p, "flow_type", "oauth") == "magic_link":
+        prefix = _prefix(request)
+        target = f"{prefix}/login"
+        if next:
+            from urllib.parse import quote
+            target += f"?next={quote(next, safe='')}"
+        return RedirectResponse(url=target, status_code=302)
 
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
@@ -619,3 +630,105 @@ async def api_auth_ws_ticket(request: Request):
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+
+
+# ---------------------------------------------------------------------------
+# Public: magic link authentication
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/auth/magic-link", name="auth_magic_link")
+async def api_auth_magic_link(request: Request):
+    """Initiate a magic link login. Always returns 200 to prevent email enumeration."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    email = body.get("email", "").strip().lower()
+    if not email or "@" not in email:
+        # Return 200 to prevent email enumeration even for bad input.
+        return {"status": "ok"}
+
+    # Allowlist check: if HERMES_DASHBOARD_ALLOWED_EMAILS is set, only those
+    # emails can receive magic links. Others get a silent 200 (no leak).
+    _allowed = os.environ.get("HERMES_DASHBOARD_ALLOWED_EMAILS", "")
+    if _allowed:
+        allowed_list = {e.strip().lower() for e in _allowed.split(",") if e.strip()}
+        if email not in allowed_list:
+            return {"status": "ok"}
+
+    from plugins.dashboard_auth.magic_link.db import create_magic_link
+    token = create_magic_link(email)
+
+    # Build the verification URL the user will click in the email.
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+    public_url = resolve_public_url()
+    if public_url:
+        verify_url = f"{public_url}/api/auth/verify?token={token}"
+    else:
+        base = str(request.url_for("auth_verify"))
+        verify_url = f"{base}?token={token}"
+
+    from hermes_cli.email_sender import send_magic_link_email
+    sent = send_magic_link_email(email, verify_url)
+    if not sent:
+        _log.warning("Failed to send magic link email to %s (rate-limited or API error)", email)
+
+    # Always return 200 to prevent email enumeration.
+    return {"status": "ok"}
+
+
+@router.get("/api/auth/verify", name="auth_verify")
+async def api_auth_verify(request: Request, token: str = ""):
+    """Verify a magic link token, create a session, and redirect to the dashboard."""
+    prefix = _prefix(request)
+    if not token:
+        return RedirectResponse(url=f"{prefix}/login", status_code=302)
+
+    from plugins.dashboard_auth.magic_link.db import verify_magic_link
+    user, error = verify_magic_link(token)
+    if error or user is None:
+        audit_log(
+            AuditEvent.LOGIN_FAILURE,
+            provider="magic_link",
+            reason="invalid_magic_link",
+            ip=_client_ip(request),
+        )
+        return RedirectResponse(
+            url=f"{prefix}/login?error=invalid_magic_link",
+            status_code=302,
+        )
+
+    provider = get_provider("magic_link")
+    if provider is None:
+        _log.error("Magic link provider not registered")
+        return RedirectResponse(
+            url=f"{prefix}/login?error=auth_error",
+            status_code=302,
+        )
+
+    session = provider.create_session(
+        user_id=user.id,
+        email=user.email,
+        display_name=user.name,
+    )
+
+    expires_in = max(60, session.expires_at - int(time.time()))
+    resp = RedirectResponse(url=f"{prefix}/", status_code=302)
+    set_session_cookies(
+        resp,
+        access_token=session.access_token,
+        refresh_token=session.refresh_token,
+        access_token_expires_in=expires_in,
+        use_https=detect_https(request),
+        prefix=prefix,
+    )
+
+    audit_log(
+        AuditEvent.LOGIN_SUCCESS,
+        provider="magic_link",
+        user_id=session.user_id,
+        email=session.email,
+        ip=_client_ip(request),
+    )
+    return resp

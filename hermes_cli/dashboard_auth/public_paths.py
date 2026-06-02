@@ -46,4 +46,9 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Read-only theme + plugin manifests for the dashboard skin engine.
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
+    # Email Hybrid Worker push ingest — protected only by the long-lived
+    # Bearer token configured in the Worker. Must remain public so the
+    # Cloudflare Worker (and other external senders) can reach it without
+    # dashboard session tokens.
+    "/api/email-ingest",
 })

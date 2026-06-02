@@ -488,6 +488,10 @@ def _apply_profile_override() -> None:
             )
             return
         os.environ["HERMES_HOME"] = hermes_home
+        # Also set HERMES_PROFILE so subcommands whose --profile flag was
+        # already consumed by the global strip can still resolve their
+        # profile-scoped paths (e.g. hermes secrets sops list).
+        os.environ["HERMES_PROFILE"] = profile_name
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:
             start = profile_index + 1  # +1 because argv is sys.argv[1:]
@@ -11514,9 +11518,13 @@ def main():
     # Lazy import — only pays for itself when this subcommand is actually used.
     from hermes_cli import secrets_cli as _secrets_cli
     from hermes_cli import secrets_sops as _secrets_sops
+    from hermes_cli import secrets_health as _secrets_health
+    from hermes_cli import secrets_registry as _secrets_registry
 
     _secrets_cli.register_cli(secrets_bw)
     _secrets_sops.register_cli(secrets_sops)
+    _secrets_health.register_cli(secrets_subparsers)
+    _secrets_registry.register_cli(secrets_subparsers)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
@@ -11525,6 +11533,10 @@ def main():
         if sub in ("bitwarden", "bw") and bw_sub is not None:
             return args.func(args)
         if sub == "sops" and sops_sub is not None:
+            return args.func(args)
+        if sub == "check":
+            return args.func(args)
+        if sub == "status":
             return args.func(args)
         secrets_parser.print_help()
         return 0
@@ -12282,7 +12294,6 @@ def main():
     # profile command  (parser built in hermes_cli/subcommands/profile.py)
     # =========================================================================
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
-
     # =========================================================================
     # completion command
     # =========================================================================
@@ -12454,11 +12465,18 @@ def main():
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command. Honor the return value as the process exit
+    # code so subcommands that return non-zero on failure (e.g.
+    # ``hermes kanban create --strict`` blocking a type-mismatched task)
+    # actually surface as a non-zero shell exit.  Some command handlers
+    # don't return anything (legacy chat path, etc.) — coerce ``None``
+    # to 0 so we don't accidentally turn them into errors.
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        return 0 if result is None else int(result)
     else:
         parser.print_help()
+        return 0
 
 
 if __name__ == "__main__":

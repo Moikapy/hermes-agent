@@ -44,12 +44,14 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/auth/providers",
     "/api/auth/magic-link",
     "/api/auth/verify",
-    "/api/auth/me",
     "/assets/",
     "/favicon.ico",
     "/ds-assets/",
     "/fonts/",
     "/fonts-terminal/",
+    "/sw.js",
+    "/manifest.webmanifest",
+    "/pwa-icon-",
 )
 
 

@@ -611,6 +611,132 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
 
 
+def _read_global_external_dirs(default_home: Path) -> List[str]:
+    """Read ``skills.external_dirs`` from the global ``~/.hermes/config.yaml``.
+
+    Returns an empty list when the file is missing, the section is absent,
+    or the value is malformed.  String entries are wrapped into a single-item
+    list (the loader in ``agent/skill_utils.get_external_skills_dirs`` accepts
+    either shape, but we always normalise to list here for consistent merging).
+    """
+    config_path = default_home / "config.yaml"
+    if not config_path.is_file():
+        return []
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return []
+    if not isinstance(cfg, dict):
+        return []
+    skills_cfg = cfg.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return []
+    raw = skills_cfg.get("external_dirs")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        s = entry.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _ensure_external_dirs(
+    profile_dir: Path,
+    *,
+    default_home: Optional[Path] = None,
+) -> bool:
+    """Merge global ``skills.external_dirs`` into a profile's ``config.yaml``.
+
+    A profile is considered "missing" the shared skills config when its
+    ``config.yaml`` has no ``skills`` key, no ``skills.external_dirs`` key,
+    or an empty ``external_dirs`` list.  In any of those cases, the
+    inherited entries from the global ``~/.hermes/config.yaml`` are
+    unioned in (profile entries win on conflict so deliberate
+    per-profile choices are preserved).
+
+    Profiles that already have a non-empty ``external_dirs`` are left
+    alone — we never silently overwrite a populated list, since that
+    would mask operator intent.  This is the contract that keeps
+    backward compat for profiles that deliberately opt out of shared
+    skills: just keep ``external_dirs`` non-empty (e.g. one entry that
+    points to an empty dir) and the merge becomes a no-op.
+
+    Returns ``True`` if the profile's ``config.yaml`` was modified.
+    Best-effort: corrupt or missing YAML is silently ignored so this
+    helper never breaks ``rename_profile`` / ``create_profile``.
+    """
+    if default_home is None:
+        default_home = _get_default_hermes_home()
+
+    global_dirs = _read_global_external_dirs(default_home)
+    if not global_dirs:
+        # Nothing to inherit — no point touching the file.
+        return False
+
+    config_path = profile_dir / "config.yaml"
+    try:
+        import yaml
+        if config_path.is_file():
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        else:
+            cfg = {}
+    except Exception:
+        return False
+    if not isinstance(cfg, dict):
+        return False
+
+    skills_cfg = cfg.get("skills")
+    if isinstance(skills_cfg, dict):
+        existing_raw = skills_cfg.get("external_dirs")
+    elif skills_cfg is None:
+        existing_raw = None
+        skills_cfg = {}
+        cfg["skills"] = skills_cfg
+    else:
+        # Non-dict ``skills`` section (e.g. a string).  Don't touch it.
+        return False
+
+    if isinstance(existing_raw, str):
+        existing = [existing_raw]
+    elif isinstance(existing_raw, list):
+        existing = [e for e in existing_raw if isinstance(e, str)]
+    elif existing_raw is None:
+        existing = []
+    else:
+        return False
+
+    # Non-empty existing list is treated as deliberate — leave it alone
+    # so operators who opt out of shared skills aren't silently dragged
+    # back in on the next rename/create.
+    if existing:
+        return False
+
+    # Empty / missing: union in the global entries.
+    merged: List[str] = list(global_dirs)
+    skills_cfg["external_dirs"] = merged
+
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+    except Exception:
+        return False
+    return True
+
+
 def _check_gateway_running(profile_dir: Path) -> bool:
     """Check if a gateway is running for a given profile directory."""
     try:
@@ -969,6 +1095,17 @@ def create_profile(
     # / launchd / windows) this is a no-op — the existing per-profile
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
+
+    # Phase 5: ensure the freshly-created profile inherits the global
+    # ``skills.external_dirs`` from ~/.hermes/config.yaml so curated
+    # shared skills (kanban-task-authoring, research-paper-writing, etc.)
+    # are visible to ``hermes -p <name> skills list`` immediately.
+    # Best-effort — a missing/corrupt global config or write failure
+    # never aborts profile creation.
+    try:
+        _ensure_external_dirs(profile_dir)
+    except Exception:
+        pass
 
     return profile_dir
 
@@ -1788,6 +1925,17 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         if get_active_profile() == old_canon:
             set_active_profile(new_canon)
             print(f"✓ Active profile updated: {new_canon}")
+    except Exception:
+        pass
+
+    # 6. Inherit the global skills.external_dirs into the renamed
+    # profile's config.yaml so shared skills (kanban-task-authoring,
+    # research-paper-writing, etc.) remain visible after a rotation.
+    # Best-effort: a missing/corrupt global config or write failure
+    # never aborts the rename.
+    try:
+        if _ensure_external_dirs(new_dir):
+            print(f"✓ Inherited global skills.external_dirs into {new_canon}")
     except Exception:
         pass
 

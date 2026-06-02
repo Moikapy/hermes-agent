@@ -31,6 +31,8 @@ from hermes_cli.profiles import (
     import_profile,
     _get_profiles_root,
     _get_default_hermes_home,
+    _ensure_external_dirs,
+    _read_global_external_dirs,
     seed_profile_skills,
     has_bundled_skills_opt_out,
     NO_BUNDLED_SKILLS_MARKER,
@@ -1487,3 +1489,158 @@ class TestEdgeCases:
             delete_profile("coder", yes=True)
 
         assert get_active_profile() == "default"
+
+    def test_ensure_external_dirs_inherits_from_global(self, profile_env):
+        """Fresh profile (no skills section) inherits global external_dirs."""
+        import yaml
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+
+        # Plant a global config with two shared skills dirs.
+        shared_a = tmp_path / "shared_skills_a"
+        shared_a.mkdir()
+        shared_b = tmp_path / "shared_skills_b"
+        shared_b.mkdir()
+        (default_home / "config.yaml").write_text(yaml.safe_dump({
+            "skills": {"external_dirs": [str(shared_a), str(shared_b)]},
+        }))
+
+        profile_dir = create_profile("alpha", no_alias=True)
+        # config.yaml was created — make sure external_dirs was merged in.
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cfg["skills"]["external_dirs"] == [str(shared_a), str(shared_b)]
+
+    def test_ensure_external_dirs_preserves_existing(self, profile_env):
+        """If profile already has a non-empty external_dirs, leave it alone."""
+        import yaml
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+
+        global_dir = tmp_path / "global_skills"
+        global_dir.mkdir()
+        (default_home / "config.yaml").write_text(yaml.safe_dump({
+            "skills": {"external_dirs": [str(global_dir)]},
+        }))
+
+        # Create the profile, then overwrite its config.yaml with an
+        # explicit non-empty list to simulate an operator's deliberate choice.
+        profile_dir = create_profile("alpha", no_alias=True)
+        custom_dir = tmp_path / "operator_choice"
+        custom_dir.mkdir()
+        (profile_dir / "config.yaml").write_text(yaml.safe_dump({
+            "skills": {"external_dirs": [str(custom_dir)]},
+        }))
+
+        # Running the helper again should not change the list.
+        assert _ensure_external_dirs(profile_dir) is False
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cfg["skills"]["external_dirs"] == [str(custom_dir)]
+
+    def test_ensure_external_dirs_noop_when_global_empty(self, profile_env):
+        """If the global config has empty external_dirs, leave profiles alone."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+
+        profile_dir = create_profile("alpha", no_alias=True)
+        # Helper should report no change.
+        assert _ensure_external_dirs(profile_dir) is False
+        # config.yaml may have been created by create_profile, but
+        # the helper should not have injected anything.
+        config_path = profile_dir / "config.yaml"
+        if config_path.exists():
+            config_text = config_path.read_text()
+            if "external_dirs" in config_text:
+                import yaml
+                cfg = yaml.safe_load(config_text)
+                assert cfg.get("skills", {}).get("external_dirs", []) == []
+
+    def test_ensure_external_dirs_handles_missing_config(self, profile_env):
+        """Helper is a no-op when neither global nor profile has a config."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        # No global config.yaml at all.
+        if (default_home / "config.yaml").exists():
+            (default_home / "config.yaml").unlink()
+
+        profile_dir = tmp_path / "scratch_profile"
+        profile_dir.mkdir()
+        # No profile config.yaml either.
+        assert _ensure_external_dirs(profile_dir) is False
+        # And no file should have been created.
+        assert not (profile_dir / "config.yaml").exists()
+
+    def test_create_profile_picks_up_global_external_dirs(self, profile_env):
+        """End-to-end: create_profile() seeds shared skills even without clone."""
+        import yaml
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        shared = tmp_path / "team_skills"
+        shared.mkdir()
+        (default_home / "config.yaml").write_text(yaml.safe_dump({
+            "skills": {"external_dirs": [str(shared)]},
+        }))
+
+        profile_dir = create_profile("newhire", no_alias=True)
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cfg["skills"]["external_dirs"] == [str(shared)]
+
+    def test_rename_profile_picks_up_global_external_dirs(self, profile_env):
+        """End-to-end: rename_profile() seeds shared skills for the new name."""
+        import yaml
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        shared = tmp_path / "team_skills"
+        shared.mkdir()
+        (default_home / "config.yaml").write_text(yaml.safe_dump({
+            "skills": {"external_dirs": [str(shared)]},
+        }))
+
+        # First create a profile that has its own config.yaml with NO
+        # skills section (mimics the original sund/dabu/davinci state).
+        profile_dir = create_profile("oldname", no_alias=True)
+        (profile_dir / "config.yaml").write_text(
+            "model:\n  default: foo\n  provider: bar\n"
+        )
+
+        with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"):
+            rename_profile("oldname", "newname")
+
+        new_dir = tmp_path / ".hermes" / "profiles" / "newname"
+        cfg = yaml.safe_load((new_dir / "config.yaml").read_text())
+        # Original model preserved.
+        assert cfg["model"]["default"] == "foo"
+        # Shared skills injected.
+        assert cfg["skills"]["external_dirs"] == [str(shared)]
+
+    def test_read_global_external_dirs_handles_string_form(self, profile_env):
+        """Some setups put a single string instead of a list; normalise to list."""
+        import yaml
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"external_dirs": "/single/dir"}})
+        )
+        assert _read_global_external_dirs(default_home) == ["/single/dir"]
+
+    def test_read_global_external_dirs_missing_file(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        if (default_home / "config.yaml").exists():
+            (default_home / "config.yaml").unlink()
+        assert _read_global_external_dirs(default_home) == []
+
+    def test_read_global_external_dirs_dedupes(self, profile_env):
+        import yaml
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text(yaml.safe_dump({
+            "skills": {"external_dirs": ["/a", "/a", "/b"]},
+        }))
+        assert _read_global_external_dirs(default_home) == ["/a", "/b"]

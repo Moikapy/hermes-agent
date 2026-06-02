@@ -24,7 +24,13 @@ export function computePrecisionWheelStep(
   hasModifier: boolean,
   now: number
 ): PrecisionWheelStep {
-  const active = hasModifier || now - state.lastEventAtMs < PRECISION_WHEEL_STICKY_MS
+  // Precision mode is for modifier-held wheel only (one row per event,
+  // line-precise). Non-modifier events must fall through to the normal
+  // wheel-accel path so sustained / fast scrolling ramps up instead of
+  // silently stalling. After the modifier is released, we honor a brief
+  // sticky window so the last burst doesn't get clipped at the boundary.
+  const sticky = state.active && now - state.lastEventAtMs < PRECISION_WHEEL_STICKY_MS
+  const active = hasModifier || sticky
 
   if (!active) {
     state.active = false

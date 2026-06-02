@@ -22,6 +22,7 @@ describe('precisionWheel', () => {
     const s = initPrecisionWheel()
 
     computePrecisionWheelStep(s, 1, true, 1000)
+    computePrecisionWheelStep(s, 1, true, 1008)
 
     expect(computePrecisionWheelStep(s, 1, false, 1050)).toMatchObject({ active: true, rows: 1 })
   })
@@ -30,8 +31,18 @@ describe('precisionWheel', () => {
     const s = initPrecisionWheel()
 
     computePrecisionWheelStep(s, 1, true, 1000)
+    computePrecisionWheelStep(s, 1, true, 1008)
 
     expect(computePrecisionWheelStep(s, 1, false, 1100)).toEqual({ active: false, entered: false, rows: 0 })
+  })
+
+  it('does not activate precision without a modifier (regression: fast scroll must hit wheel accel path)', () => {
+    const s = initPrecisionWheel()
+
+    // Fast scroll, no modifier — should NOT engage precision mode.
+    expect(computePrecisionWheelStep(s, 1, false, 1000)).toEqual({ active: false, entered: false, rows: 0 })
+    expect(computePrecisionWheelStep(s, 1, false, 1008).rows).toBe(0)
+    expect(computePrecisionWheelStep(s, 1, false, 1016).rows).toBe(0)
   })
 
   it('does not coalesce immediate reversals', () => {

@@ -11,7 +11,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import get_hermes_home, get_default_hermes_root, get_skills_dir, is_wsl
 from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
@@ -223,6 +223,14 @@ KANBAN_GUIDANCE = (
     "reviewer can approve+unblock or request changes. Reviewing-then-"
     "completing is more honest than auto-completing work that still needs "
     "eyes on it.\n"
+    "    **Default to `kanban_block(reason=\"review-required: ...\")` for any task that modifies ANY of the following — these are the production system and the cost of an auto-complete that OYKAPY has to verify post-hoc from git diffs is higher than the cost of a clean review handoff:**\n"
+    "    - `~/.hermes/hermes-agent/` source code (anything under the hermes-agent repo)\n"
+    "    - `~/.hermes/profiles/<name>/` per-profile config, secrets, SOUL.md\n"
+    "    - `~/.hermes/config.yaml`, `~/.hermes/.env`\n"
+    "    - `kapy-content-api/` routes or D1 migrations\n"
+    "    - `forge-queue/scripts/` deploy scripts\n"
+    "    - Any system service (systemd units, cron jobs, daemon configs)\n"
+    "    For research tasks (davinci writing to `notes/Research/` etc.) and pure-vault edits, auto-completing is fine — the deliverable is a markdown the operator can read directly. When in doubt, block for review; OYKAPY can always approve+complete in 10 seconds.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
     "to spawn a child task for the appropriate specialist profile instead of "
@@ -251,7 +259,37 @@ KANBAN_GUIDANCE = (
     "specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is "
     "for short reasoning subtasks inside your own run; board tasks are for "
-    "cross-agent handoffs that outlive one API loop."
+    "cross-agent handoffs that outlive one API loop.\n"
+    "\n"
+    "## HARD EXIT PROTOCOL (read before you stop)\n"
+    "\n"
+    "Your process will be killed by the dispatcher if it stays in `running` "
+    "with no terminal transition (kanban_complete or kanban_block). When "
+    "the dispatcher's reap loop finds your PID gone but the task is still "
+    "`running`, it records a `protocol_violation` event and (after one "
+    "retry) auto-blocks the task. The operator gets a noisy Discord alert. "
+    "False-positive alerts are the #1 cause of pager fatigue in this system.\n"
+    "\n"
+    "**Before you finish your final turn — even if the work failed or you ran "
+    "out of context — you MUST call exactly ONE of these:**\n"
+    "\n"
+    "- `kanban_complete(summary=..., metadata=...)` — work shipped, even "
+    "partially. List the files you wrote in `metadata[\"changed_files\"]` so "
+    "the auto-recovery detector can find your deliverable even if THIS call "
+    "somehow fails to land.\n"
+    "- `kanban_block(reason=\"...\")` — work blocked on something only a "
+    "human can resolve (missing credential, ambiguous spec, paywalled "
+    "source). The dispatcher re-queues you after the human unblocks.\n"
+    "\n"
+    "**Anti-pattern:** writing the deliverable to disk, printing a summary, "
+    "and exiting without calling either tool. The dispatcher CANNOT see "
+    "your final assistant text — it only sees the DB state and your exit "
+    "code. If the DB still says `running` when you exit, you have failed "
+    "the protocol regardless of how good your output was.\n"
+    "\n"
+    "If you're unsure whether to complete or block, complete — partial work "
+    "with a clear summary is better than a protocol violation. You can "
+    "always create a follow-up task for the missing pieces."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
@@ -1475,12 +1513,45 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     return head + marker + tail
 
 
-def load_soul_md() -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+def _candidate_soul_paths() -> list:
+    """Return candidate SOUL.md paths to try, in priority order.
 
-    Used as the agent identity (slot #1 in the system prompt).  When this
-    returns content, ``build_context_files_prompt`` should be called with
-    ``skip_soul=True`` so SOUL.md isn't injected twice.
+    The primary path is ``<HERMES_HOME>/SOUL.md`` — this is the canonical
+    location for every profile (named and default).
+
+    For the **default** profile, ``HERMES_HOME`` resolves to the Hermes
+    root (``~/.hermes``) rather than a ``profiles/default/`` subdirectory
+    (see ``hermes_cli.profiles.get_profile_dir``).  Users who followed the
+    multi-profile rollout plan and wrote their default SOUL at the
+    profile-relative path ``<root>/profiles/default/SOUL.md`` would
+    otherwise see no SOUL loaded.  We therefore fall back to that path
+    when the primary lookup misses, so a SOUL at either location is
+    picked up automatically.
+
+    For named profiles the second candidate is harmless — it points
+    inside the profile's own directory and almost never exists there.
+    """
+    home = get_hermes_home()
+    paths = [home / "SOUL.md"]
+    try:
+        root = get_default_hermes_root()
+    except Exception:
+        root = None
+    if root is not None and home.resolve() == root.resolve():
+        # Default profile: home IS the Hermes root.  Fall back to the
+        # ``profiles/default/SOUL.md`` subdirectory layout that the
+        # multi-profile rollout plan documents.
+        paths.append(root / "profiles" / "default" / "SOUL.md")
+    return paths
+
+
+def _ensure_home_seeded() -> None:
+    """Best-effort ``ensure_hermes_home()`` call, swallowing all errors.
+
+    In production this materializes the Hermes home directory structure
+    (with secure permissions) and seeds a default ``SOUL.md`` if one
+    doesn't exist yet.  Tests stub this out to avoid touching the real
+    filesystem under ``Path.home()``.
     """
     try:
         from hermes_cli.config import ensure_hermes_home
@@ -1488,19 +1559,30 @@ def load_soul_md() -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
-        return None
-    try:
-        content = soul_path.read_text(encoding="utf-8").strip()
-        if not content:
+
+def load_soul_md() -> Optional[str]:
+    """Load SOUL.md from HERMES_HOME and return its content, or None.
+
+    Used as the agent identity (slot #1 in the system prompt).  When this
+    returns content, ``build_context_files_prompt`` should be called with
+    ``skip_soul=True`` so SOUL.md isn't injected twice.
+    """
+    _ensure_home_seeded()
+
+    for soul_path in _candidate_soul_paths():
+        if not soul_path.exists():
+            continue
+        try:
+            content = soul_path.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            content = _scan_context_content(content, "SOUL.md")
+            content = _truncate_content(content, "SOUL.md")
+            return content
+        except Exception as e:
+            logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
             return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(content, "SOUL.md")
-        return content
-    except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
-        return None
+    return None
 
 
 def _load_hermes_md(cwd_path: Path) -> str:

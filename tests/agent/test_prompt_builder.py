@@ -25,6 +25,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    KANBAN_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -47,6 +48,22 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_kanban_guidance_tells_workers_to_commit_before_finishing(self):
+        # Step 7: workers writing to a worktree / tracked repo must commit
+        # before calling kanban_complete or kanban_block, and the message
+        # format must include the task id prefix.
+        assert "Commit your work before you finish" in KANBAN_GUIDANCE
+        assert "git add" in KANBAN_GUIDANCE
+        assert "git commit" in KANBAN_GUIDANCE
+        assert "kanban_complete" in KANBAN_GUIDANCE
+        assert "kanban_block" in KANBAN_GUIDANCE
+        assert "t_5c55e3c4: add assignee-vs-task-type validation" in KANBAN_GUIDANCE
+        # The worktree-vs-scratch hint and the auto-branch name.
+        assert "--workspace worktree" in KANBAN_GUIDANCE
+        assert "wt/<task-id>" in KANBAN_GUIDANCE
+        # Fallback for scratch workspaces: changed_files manifest.
+        assert 'changed_files' in KANBAN_GUIDANCE
 
 
 # =========================================================================

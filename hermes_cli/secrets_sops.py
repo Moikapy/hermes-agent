@@ -41,24 +41,85 @@ console = Console()
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 SOPS_BIN = os.environ.get("SOPS_PATH", "sops")
-AGE_KEY_PATH = Path.home() / ".config" / "sops" / "age" / "keys.txt"
+
+# Determine the real user home (not a profile-specific fake home) so SOPS
+# can locate the age key at ~/.config/sops/age/keys.txt.
+def _real_home() -> Path:
+    """Return the real user home directory, bypassing profile fake homes."""
+    home = os.environ.get("HOME", "")
+    # Hermes profiles set HOME to <profile>/home.  Strip that suffix.
+    if home and "/.hermes/profiles/" in home:
+        idx = home.find("/.hermes/profiles/")
+        if idx != -1:
+            return Path(home[:idx])
+    return Path.home()
+
+_AGE_KEY_PATH = _real_home() / ".config" / "sops" / "age" / "keys.txt"
+
+# For backwards compat with any code using the module-level constant directly:
+AGE_KEY_PATH = _AGE_KEY_PATH
+
+
+def _sops_env() -> Dict[str, str]:
+    """Build an env dict that points SOPS/age at the real key file."""
+    env = dict(os.environ)
+    real = str(_real_home())
+    env["HOME"] = real
+    env["SOPS_AGE_KEY_FILE"] = str(_AGE_KEY_PATH)
+    return env
 
 
 def _secrets_file(profile: Optional[str] = None) -> Path:
-    """Return the path to the secrets.enc.yaml for the given profile."""
+    """Return the path to the secrets.enc.yaml for the given profile.
+
+    Profile resolution order:
+      1. Explicit ``profile`` arg (from --profile on the subcommand).
+      2. ``HERMES_PROFILE`` env var (set by ``_apply_profile_override()`` in
+         hermes_cli/main.py — survives the global ``--profile`` strip).
+      3. ``HERMES_HOME`` pointing at a profile directory (sund/.../profiles/X).
+      4. The real user home's ``~/.hermes`` root — NOT the profile-faked HOME
+         (per-process agents run with HOME=<profile>/home, which breaks
+         ``Path.home() / ".hermes"`` resolution).
+      5. ``current_profile`` from config.yaml (legacy "dashboard" fallback).
+    """
+    # Resolve the real Hermes root (bypassing per-profile fake HOME) and
+    # cache it on the module so we only strip the fake-home suffix once.
+    real_root = _real_home() / ".hermes"
+
+    # 1. Explicit profile argument from the subparser
     if profile:
-        p = HERMES_HOME / "profiles" / profile
-    else:
-        # Default to current profile from config
-        try:
-            cfg = load_config()
-            profile_name = cfg.get("current_profile", "dashboard") if isinstance(cfg, dict) else "dashboard"
-        except Exception:
-            profile_name = "dashboard"
-        p = HERMES_HOME / "profiles" / profile_name
-    return p / "secrets.enc.yaml"
+        return real_root / "profiles" / profile / "secrets.enc.yaml"
+
+    # 2. HERMES_PROFILE env (set by main._apply_profile_override() before
+    # it strips the global --profile flag from sys.argv)
+    env_profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if env_profile:
+        return real_root / "profiles" / env_profile / "secrets.enc.yaml"
+
+    # 3. HERMES_HOME pointing at a profile directory
+    env_home = os.environ.get("HERMES_HOME", "")
+    if env_home:
+        env_path = Path(env_home)
+        # Two shapes to recognise:
+        #   a) <root>/profiles/<name>  -> use directly
+        #   b) <root>/profiles/<name>/home  -> the per-profile fake home
+        if env_path.parent.name == "profiles":
+            return env_path / "secrets.enc.yaml"
+        if env_path.parent.name == "home" and env_path.parent.parent.name == "profiles":
+            return env_path / ".." / "secrets.enc.yaml"
+
+    # 4. Real Hermes root (real user home, not per-profile fake)
+    #    Derive the profile name from the parent of HERMES_HOME if it
+    #    already points at a profile subdir we missed above; otherwise
+    #    fall through to the config-based default.
+    # 5. Legacy fallback: current_profile from config.yaml
+    try:
+        cfg = load_config()
+        profile_name = cfg.get("current_profile", "default") if isinstance(cfg, dict) else "default"
+    except Exception:
+        profile_name = "default"
+    return real_root / "profiles" / profile_name / "secrets.enc.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +133,7 @@ def _check_sops() -> str:
         result = subprocess.run(
             [SOPS_BIN, "--version"],
             capture_output=True, text=True, timeout=10,
+            env=_sops_env(),
         )
         if result.returncode != 0:
             raise RuntimeError(f"sops --version failed: {result.stderr}")
@@ -103,6 +165,7 @@ def _sops_decrypt(filepath: Path) -> Dict[str, Any]:
         result = subprocess.run(
             [sops, "-d", "--input-type", "yaml", "--output-type", "yaml", str(filepath)],
             capture_output=True, text=True, timeout=30,
+            env=_sops_env(),
         )
         if result.returncode != 0:
             raise RuntimeError(f"sops decrypt failed: {result.stderr}")
@@ -117,6 +180,7 @@ def _sops_encrypt_file(filepath: Path) -> None:
     result = subprocess.run(
         [sops, "-e", "--in-place", str(filepath)],
         capture_output=True, text=True, timeout=30,
+        env=_sops_env(),
     )
     if result.returncode != 0:
         raise RuntimeError(f"sops encrypt failed: {result.stderr}")
@@ -131,6 +195,7 @@ def _sops_set(filepath: Path, dotted_key: str, value: str) -> None:
     result = subprocess.run(
         [sops, "--set", sops_key, json_value, str(filepath)],
         capture_output=True, text=True, timeout=30,
+        env=_sops_env(),
     )
     if result.returncode != 0:
         raise RuntimeError(f"sops --set failed: {result.stderr}")
@@ -859,8 +924,9 @@ def cmd_rotate(args: argparse.Namespace) -> int:
         return 1
 
     # Check key exists
-    entry = _get_nested(data, key_path)
-    if entry is None:
+    try:
+        entry = _get_nested(data, key_path)
+    except KeyError:
         console.print(f"[red]✗ Key not found: {key_path}[/red]")
         return 1
 
@@ -943,19 +1009,21 @@ def cmd_updatekeys(args: argparse.Namespace) -> int:
         result = subprocess.run(
             ["sops", "updatekeys", str(secrets_path)],
             capture_output=True, text=True, timeout=30,
+            env=_sops_env(),
         )
         if result.returncode != 0:
-            console.print(f"[red]✗ updatekeys failed: {result.stderr.strip()}[/red]")
-            return 1
-
-        # Check if the output asks for confirmation (interactive mode)
-        if "Are you sure" in result.stdout or "Are you sure" in result.stderr:
-            # Re-run with --yes flag
-            result = subprocess.run(
-                ["sops", "updatekeys", "--yes", str(secrets_path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
+            # Check if the output asks for confirmation (interactive mode)
+            if "Are you sure" in result.stdout or "Are you sure" in result.stderr:
+                # Re-run with --yes flag
+                result = subprocess.run(
+                    ["sops", "updatekeys", "--yes", str(secrets_path)],
+                    capture_output=True, text=True, timeout=30,
+                    env=_sops_env(),
+                )
+                if result.returncode != 0:
+                    console.print(f"[red]✗ updatekeys failed: {result.stderr.strip()}[/red]")
+                    return 1
+            else:
                 console.print(f"[red]✗ updatekeys failed: {result.stderr.strip()}[/red]")
                 return 1
 

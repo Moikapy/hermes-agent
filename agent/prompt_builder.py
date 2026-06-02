@@ -247,10 +247,11 @@ KANBAN_GUIDANCE = (
     "over `scratch` when creating or claiming the task. The kanban auto-"
     "creates a `wt/<task-id>` branch and your commits land there for clean "
     "per-task review and easy revert.\n"
+    "If your task body has more than 7 distinct action items (count bullets + numbered steps + checkboxes combined), the body is too large for 90 iterations. Stop, run `hermes kanban decompose <your-task-id>` to split it into children, link them as parent, claim the first one, and start on that. Then the next worker picks up the next child.\n"
     "\n"
     "## Orchestrator mode\n"
     "\n"
-    "If your task is itself a decomposition task (e.g. a planner profile given "
+
     "a high-level goal), use `kanban_create` to fan out into child tasks — one "
     "per specialist, each with an explicit `assignee` and `parents=[...]` to "
     "express dependencies. Then `kanban_complete` your own task with a summary "
@@ -827,7 +828,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
         probe_cmd = (
-            "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
+            "printf 'os=%s\nkernel=%s\nhome=%s\ncwd=%s\nuser=%s\n' "
             "\"$(uname -s 2>/dev/null || echo unknown)\" "
             "\"$(uname -r 2>/dev/null || echo unknown)\" "
             "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""

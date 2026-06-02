@@ -64,6 +64,9 @@ class TestGuidanceConstants:
         assert "wt/<task-id>" in KANBAN_GUIDANCE
         # Fallback for scratch workspaces: changed_files manifest.
         assert 'changed_files' in KANBAN_GUIDANCE
+        # WT-8A: decompose-if-body-too-large rule (step 7 extension)
+        assert "more than 7 distinct action items" in KANBAN_GUIDANCE
+        assert "hermes kanban decompose <your-task-id>" in KANBAN_GUIDANCE
 
 
 # =========================================================================

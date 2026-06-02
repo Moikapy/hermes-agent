@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import sys
@@ -665,6 +666,190 @@ def test_detect_crashed_workers_grace_period_env_override(
         # 6s after claim: past 5s grace → reclaim.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 6)
         assert tid in kb.detect_crashed_workers(conn)
+
+
+# ---------------------------------------------------------------------------
+# Ambient-zone auto-recovery (t_9a81dc4a)
+# ---------------------------------------------------------------------------
+
+def _place_task_in_running_state(
+    conn, assignee: str, started_at: float, workspace_path=None,
+) -> str:
+    """Helper: create a task, claim it, and set it to running with a known
+    ``started_at``. Mirrors the synthetic 'crashed worker' state used by
+    the detect_crashed_workers tests above, but skips the crashed PID
+    dance — the soft-complete scanner is called directly.
+    """
+    import hermes_cli.kanban_db as _kb
+    host = _kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="ambient-zone test", assignee=assignee)
+    conn.execute(
+        "UPDATE tasks SET status='running', worker_pid=?, "
+        "claim_lock=?, started_at=?, workspace_path=? WHERE id=?",
+        (12345, f"{host}:w", int(started_at), workspace_path, tid),
+    )
+    conn.commit()
+    return tid
+
+
+def _running_row_for(conn, task_id: str):
+    """Return the task as a sqlite3.Row (the production caller passes
+    sqlite3.Row, not the kanban_db.Task namedtuple returned by
+    ``get_task``). The soft-complete scanner does ``row["id"]`` /
+    ``row["assignee"]`` / ``row["started_at"]`` indexing, so we have
+    to hand it something that supports ``__getitem__``.
+    """
+    return conn.execute(
+        "SELECT * FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+
+
+@pytest.fixture
+def ambient_zone_tmpdir(monkeypatch, tmp_path):
+    """Pin the AMBIENT_ZONES dict to a controlled tmp_path so the
+    scanner doesn't walk the real ``~/.hermes/profiles/`` or the real
+    hermes-agent source tree (which contains thousands of recently
+    modified files and would always beat any test fixture). The
+    ``kanban_home`` fixture already pins ``HERMES_HOME``; this fixture
+    adds the second pin (the AMBIENT_ZONES entries themselves) so the
+    test can be deterministic.
+    """
+    import hermes_cli.kanban_db as _kb
+    # AMBIENT_ZONES is a module-level dict that ``_get_ambient_zones``
+    # populates lazily on first access. We must (a) make sure it is
+    # empty before we set the test values, otherwise the scanner would
+    # fall through to the cached real paths, and (b) restore the
+    # original dict contents at teardown so other tests in the same
+    # pytest process see a clean state.
+    original = dict(_kb.AMBIENT_ZONES)
+    _kb.AMBIENT_ZONES.clear()
+    # Override AMBIENT_ZONES for the test. The "sund" zone covers the
+    # tmp_path's profiles dir; the "hermes-agent" zone is a sibling
+    # tmp_path so the test can stage files in either.
+    profile_root = tmp_path / "profiles"
+    profile_root.mkdir(parents=True, exist_ok=True)
+    agent_root = tmp_path / "hermes-agent"
+    agent_root.mkdir(parents=True, exist_ok=True)
+    _kb.AMBIENT_ZONES["sund"] = [
+        str(profile_root) + "/",
+        str(agent_root) + "/",
+    ]
+    _kb.AMBIENT_ZONES["default"] = [str(profile_root / "default") + "/"]
+    yield {"profiles": profile_root, "agent": agent_root}
+    # Teardown: restore the dict the way we found it. (The lazy builder
+    # will refill on the next access if other tests need it.)
+    _kb.AMBIENT_ZONES.clear()
+    _kb.AMBIENT_ZONES.update(original)
+
+
+def test_soft_complete_finds_deliverable_in_ambient_zone(
+    kanban_home, tmp_path, monkeypatch, ambient_zone_tmpdir,
+):
+    """Worker writes the deliverable to its assignee's ambient zone
+    (no in-workspace file) and exits cleanly → auto-recovery should
+    find the file in the ambient zone and soft-complete the task.
+
+    Reproduces the false-crash pattern from t_25d0ca55, t_6279d718,
+    t_b40eec7c (sund + davinci tasks that shipped to their natural
+    homes and exited without calling kanban_complete).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # Workspace is empty — what the worker would see if it didn't write
+    # anything locally (sund coding pattern: edits happen in the source
+    # tree, not the scratch workspace).
+    empty_workspace = tmp_path / "empty-ws"
+    empty_workspace.mkdir()
+
+    # The fixture pins the AMBIENT_ZONES dict to a tmp_path-based
+    # profile root so the test is deterministic and doesn't see the
+    # real source tree.
+    profile_dir = ambient_zone_tmpdir["profiles"] / "sund"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    deliverable = profile_dir / "secrets.enc.yaml"
+    deliverable.write_text(
+        "keys:\n  research: ENC[...]\n  visual: ENC[...]\n" * 5,
+        encoding="utf-8",
+    )
+    # Make sure the mtime is well after the started_at we'll use.
+    started_at = time.time() - 5
+    os.utime(deliverable, (started_at + 1, started_at + 1))
+
+    with kb.connect() as conn:
+        tid = _place_task_in_running_state(
+            conn, assignee="sund",
+            started_at=started_at,
+            workspace_path=str(empty_workspace),
+        )
+        row = _running_row_for(conn, tid)
+        # Call the scanner directly — same entry point detect_crashed_workers
+        # uses on the recovery branch.
+        result = _kb._try_soft_complete_from_workspace(
+            conn, row, pid=12345, exit_code=0,
+        )
+        assert result == tid, "scanner should soft-complete the task"
+
+        # Verify the task moved to 'done' and the result/event carry the
+        # ambient-zone metadata so operators can tell at a glance.
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert "auto-recovered" in (task.result or "")
+        assert "ambient:sund" in (task.result or "")
+        assert str(deliverable) in (task.result or "")
+
+        events = kb.list_events(conn, tid)
+        completed = [e for e in events if e.kind == "completed"]
+        assert len(completed) == 1
+        payload = completed[0].payload
+        assert payload["auto_recovered"] is True
+        assert payload["auto_recovered_zone"] == "ambient:sund"
+        assert payload["deliverable"] == str(deliverable)
+
+
+def test_soft_complete_does_not_match_pre_started_files(
+    kanban_home, tmp_path, monkeypatch, ambient_zone_tmpdir,
+):
+    """Files older than started_at must NOT trigger ambient-zone
+    auto-recovery, even if they sit inside the assignee's ambient zone.
+
+    Guards against the scanner accidentally 'finding' old notes / config
+    files that pre-date the worker's run and soft-completing a task that
+    had no real deliverable.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    # Empty workspace.
+    empty_workspace = tmp_path / "empty-ws"
+    empty_workspace.mkdir()
+
+    # Profile dir with a stale file (modified well before started_at).
+    profile_dir = ambient_zone_tmpdir["profiles"] / "sund"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    stale = profile_dir / "stale-config.yaml"
+    stale.write_text("x" * 200, encoding="utf-8")
+    started_at = time.time() - 100
+    os.utime(stale, (started_at - 50, started_at - 50))
+
+    with kb.connect() as conn:
+        tid = _place_task_in_running_state(
+            conn, assignee="sund",
+            started_at=started_at,
+            workspace_path=str(empty_workspace),
+        )
+        row = _running_row_for(conn, tid)
+        result = _kb._try_soft_complete_from_workspace(
+            conn, row, pid=12345, exit_code=0,
+        )
+        # No deliverable found — scanner must return None and leave the
+        # task in 'running' so the protocol-violation path can trip.
+        assert result is None, (
+            "scanner should not match files older than started_at"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "running", (
+            "task must remain running so the protocol-violation crash path "
+            "can fire on a real protocol violation"
+        )
 
 
 def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
@@ -4372,3 +4557,255 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# migrate_assignee(): post-rotation recovery helper
+#
+# After ``hermes profile rename sund davinci`` the tasks already assigned
+# to ``sund`` are stranded.  ``migrate_assignee`` rewrites them in one
+# transaction and emits a ``migrated`` event per row.  These tests pin
+# down the safety contract:
+#   * only ready/todo/blocked are touched by default
+#   * running rows are surfaced as skipped_running
+#   * done/archived are preserved unless explicitly opted in
+#   * a same-profile migration is a no-op (zero updates)
+#   * case-only renames are normalised like reassign_task
+# ---------------------------------------------------------------------------
+
+
+def _make_migrate_tasks(conn, *, n_ready=2, n_done=1, n_running=1):
+    """Helper: create a mix of tasks across statuses for migration tests."""
+    tids = {"ready": [], "done": [], "running": []}
+    for _ in range(n_ready):
+        tid = kb.create_task(conn, title="ready", assignee="old")
+        tids["ready"].append(tid)
+    for _ in range(n_done):
+        tid = kb.create_task(conn, title="done", assignee="old")
+        kb.assign_task(conn, tid, "old")
+        # Force the row to 'done' directly so we can test the skip path.
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        tids["done"].append(tid)
+    for _ in range(n_running):
+        tid = kb.create_task(conn, title="running", assignee="old")
+        kb.claim_task(conn, tid)
+        tids["running"].append(tid)
+    return tids
+
+
+def test_migrate_assignee_default_statuses(kanban_home):
+    """Default migrate touches only ready/todo/blocked."""
+    with kb.connect() as conn:
+        tids = _make_migrate_tasks(conn)
+        result = kb.migrate_assignee(conn, "old", "new")
+    assert set(result["updated"]) == set(tids["ready"])
+    assert set(result["skipped_running"]) == set(tids["running"])
+    # Done tasks are not touched, and not reported in skipped_running.
+    assert tids["done"] not in result["updated"]
+    assert tids["done"] not in result["skipped_running"]
+    # Verify column was rewritten.
+    with kb.connect() as conn:
+        for tid in tids["ready"]:
+            assert kb.get_task(conn, tid).assignee == "new"
+        # done / running still point to old.
+        for tid in tids["done"] + tids["running"]:
+            assert kb.get_task(conn, tid).assignee == "old"
+
+
+def test_migrate_assignee_emits_migrated_event(kanban_home):
+    """Each updated row records a 'migrated' event with from/to payload."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+        kb.migrate_assignee(conn, "sund", "davinci", reason="rotation 2026-06-01")
+        events = list(conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (tid,),
+        ))
+    kinds = [e["kind"] for e in events]
+    assert "migrated" in kinds
+    # The latest 'migrated' event payload should carry from/to/reason.
+    migrated_event = next(e for e in events if e["kind"] == "migrated")
+    payload = json.loads(migrated_event["payload"])
+    assert payload["from"] == "sund"
+    assert payload["to"] == "davinci"
+    assert payload["reason"] == "rotation 2026-06-01"
+
+
+def test_migrate_assignee_noop_when_same_profile(kanban_home):
+    """Migrating a profile to itself is a no-op."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="alpha")
+        result = kb.migrate_assignee(conn, "alpha", "alpha")
+    assert result["updated"] == []
+    assert result["skipped_running"] == []
+    # Row untouched.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "alpha"
+
+
+def test_migrate_assignee_canonicalises_case(kanban_home):
+    """Case-only renames are normalised before matching."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+        result = kb.migrate_assignee(conn, "Sund", "Davinci")
+    assert tid in result["updated"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "davinci"
+
+
+def test_migrate_assignee_can_unassign(kanban_home):
+    """Passing new_assignee=None clears the assignee field."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+        result = kb.migrate_assignee(conn, "sund", None)
+    assert tid in result["updated"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee is None
+
+
+def test_migrate_assignee_resets_failure_counters(kanban_home):
+    """A migrated row should not inherit the previous assignee's failure streak."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+        # Manually inflate the failure counter on the row.
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=4, last_failure_error='boom' "
+            "WHERE id=?",
+            (tid,),
+        )
+        kb.migrate_assignee(conn, "sund", "davinci")
+        row = kb.get_task(conn, tid)
+    assert row.assignee == "davinci"
+    assert row.consecutive_failures == 0
+    assert row.last_failure_error is None
+
+
+def test_migrate_assignee_include_done(kanban_home):
+    """Opt-in to rewrite done tasks (default skips them)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        # Without --include-done: skipped.
+        r1 = kb.migrate_assignee(conn, "sund", "davinci")
+        assert tid not in r1["updated"]
+        # With include-done via statuses=
+        r2 = kb.migrate_assignee(
+            conn, "sund", "davinci", statuses=("done", "ready", "todo", "blocked"),
+        )
+    assert tid in r2["updated"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "davinci"
+
+
+def test_migrate_assignee_include_archived(kanban_home):
+    """include_archived=True surfaces archived rows in the candidate set."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
+        # Default skips archived.
+        r1 = kb.migrate_assignee(conn, "sund", "davinci")
+        assert tid not in r1["updated"]
+        # include_archived=True surfaces them.
+        r2 = kb.migrate_assignee(conn, "sund", "davinci", include_archived=True)
+    assert tid in r2["updated"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "davinci"
+
+
+def test_migrate_assignee_no_match(kanban_home):
+    """Migrating from a non-existent assignee returns zero updates and clean skip list."""
+    with kb.connect() as conn:
+        kb.create_task(conn, title="x", assignee="someone-else")
+        result = kb.migrate_assignee(conn, "nonexistent", "davinci")
+    assert result == {"updated": [], "skipped_running": []}
+
+
+def test_migrate_assignee_partial_running_skipped(kanban_home):
+    """A mixed set: 2 ready (updated) + 1 running (skipped)."""
+    with kb.connect() as conn:
+        ready_a = kb.create_task(conn, title="a", assignee="sund")
+        ready_b = kb.create_task(conn, title="b", assignee="sund")
+        running = kb.create_task(conn, title="c", assignee="sund")
+        kb.claim_task(conn, running)
+        result = kb.migrate_assignee(conn, "sund", "davinci")
+    assert set(result["updated"]) == {ready_a, ready_b}
+    assert result["skipped_running"] == [running]
+    # Running row's assignee stays the same (the safety guard's job).
+    with kb.connect() as conn:
+        assert kb.get_task(conn, running).assignee == "sund"
+
+
+def test_migrate_assignee_cli_invocation(kanban_home, monkeypatch, capsys):
+    """End-to-end through ``hermes kanban migrate-assignee`` CLI."""
+    from hermes_cli.kanban import kanban_command
+    import argparse
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="migrate me", assignee="sund")
+
+    args = argparse.Namespace(
+        kanban_action="migrate-assignee",
+        old_assignee="sund",
+        new_assignee="davinci",
+        include_archived=False,
+        include_done=False,
+        include_running=False,
+        reason="profile-rotation test",
+        json=True,
+    )
+    rc = kanban_command(args)
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert tid in payload["updated"]
+    assert payload["new_assignee"] == "davinci"
+    assert payload["old_assignee"] == "sund"
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee == "davinci"
+
+
+def test_migrate_assignee_cli_no_match_returns_1(kanban_home, capsys):
+    """CLI returns exit code 1 when no tasks match (so scripts can detect it)."""
+    from hermes_cli.kanban import kanban_command
+    import argparse
+
+    args = argparse.Namespace(
+        kanban_action="migrate-assignee",
+        old_assignee="nonexistent",
+        new_assignee="davinci",
+        include_archived=False,
+        include_done=False,
+        include_running=False,
+        reason=None,
+        json=False,
+    )
+    rc = kanban_command(args)
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "nonexistent" in captured.err
+
+
+def test_migrate_assignee_cli_unassign_via_none(kanban_home, capsys):
+    """The string 'none' / '-' clears the assignee through the CLI."""
+    from hermes_cli.kanban import kanban_command
+    import argparse
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="sund")
+
+    args = argparse.Namespace(
+        kanban_action="migrate-assignee",
+        old_assignee="sund",
+        new_assignee="none",
+        include_archived=False,
+        include_done=False,
+        include_running=False,
+        reason=None,
+        json=False,
+    )
+    rc = kanban_command(args)
+    assert rc == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).assignee is None

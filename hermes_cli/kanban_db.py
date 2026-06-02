@@ -86,7 +86,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, List, Optional
 
 from toolsets import get_toolset_names
 
@@ -3427,6 +3427,103 @@ def reassign_task(
         return False
 
 
+def migrate_assignee(
+    conn: sqlite3.Connection,
+    old_assignee: str,
+    new_assignee: Optional[str],
+    *,
+    statuses: Optional[Iterable[str]] = None,
+    include_archived: bool = False,
+    reason: Optional[str] = None,
+) -> dict:
+    """Bulk-reassign all matching tasks from ``old_assignee`` to ``new_assignee``.
+
+    Intended for the post-profile-rotation recovery path: after
+    ``hermes profile rename sund davinci``, tasks that still carry
+    ``assignee='sund'`` are stranded — the dispatcher skips them as
+    non-spawnable.  ``migrate_assignee`` rewrites the assignee column
+    in one transaction and emits a ``migrated`` event per row so the
+    audit trail is complete.
+
+    Safety: only statuses in ``statuses`` are touched (default
+    ``{"ready", "todo", "blocked"}`` — never ``running``, since a live
+    claim must be reclaimed first; never ``archived`` unless
+    ``include_archived=True``).  Set ``new_assignee=None`` to clear
+    the assignee field (reassigning to "unassigned" is the standard
+    way to nudge a row out of the dispatcher's pull set when no
+    replacement profile exists).
+
+    Returns a dict ``{"updated": [...], "skipped_running": [...]}``
+    so the caller can report per-task outcomes.  Both lists contain
+    task ids.
+    """
+    old_canon = _canonical_assignee(old_assignee)
+    new_canon = _canonical_assignee(new_assignee)
+
+    if statuses is None:
+        statuses = ("ready", "todo", "blocked")
+    statuses = tuple(statuses)
+
+    # ``include_archived`` widens the candidate set beyond the default
+    # statuses — without this, archived rows are excluded by the
+    # status filter even when the caller explicitly asked to see
+    # them.  Operators using ``migrate-assignee --include-archived`` to
+    # rewrite historical rows on a defunct profile expect archived
+    # tasks to flow through the same UPDATE+event path as ready ones.
+    if include_archived and "archived" not in statuses:
+        statuses = statuses + ("archived",)
+
+    if old_canon == new_canon:
+        # No-op: caller asked to migrate a profile to itself. Surface
+        # this as zero updates rather than silently succeeding, so the
+        # CLI can print "nothing to do" instead of misleading counts.
+        return {"updated": [], "skipped_running": []}
+
+    updated: List[str] = []
+    skipped_running: List[str] = []
+    with write_txn(conn):
+        # Snapshot the candidate set under the same transaction so a
+        # concurrent claim cannot race us into touching a row that
+        # flipped to 'running' between SELECT and UPDATE.
+        candidate_rows = conn.execute(
+            f"SELECT id, status, assignee FROM tasks "
+            f"WHERE assignee = ? "
+            + ("" if include_archived else "AND status != 'archived' "),
+            (old_canon,),
+        ).fetchall()
+
+        for row in candidate_rows:
+            tid = row["id"]
+            if row["status"] == "running":
+                # Running rows are always treated specially: even if the
+                # caller passes --include-running, the live claim must be
+                # reclaimed BEFORE we rewrite the assignee (otherwise the
+                # worker's next state flush would clobber us).  Surface
+                # the id in skipped_running so the caller knows.
+                skipped_running.append(tid)
+                continue
+            if row["status"] not in statuses:
+                # 'done' and other non-targeted statuses are silently
+                # skipped — preserving the historical record by default.
+                continue
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                "last_failure_error = NULL WHERE id = ?",
+                (new_canon, tid),
+            )
+            payload: dict = {
+                "from": old_canon,
+                "to": new_canon,
+                "status": row["status"],
+            }
+            if reason:
+                payload["reason"] = reason
+            _append_event(conn, tid, "migrated", payload)
+            updated.append(tid)
+
+    return {"updated": updated, "skipped_running": skipped_running}
+
+
 def _verify_created_cards(
     conn: sqlite3.Connection,
     completing_task_id: str,
@@ -5437,6 +5534,263 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+def _build_ambient_zones() -> dict[str, list[str]]:
+    """Return the per-profile ambient-zone list, resolved at call time
+    against the active Hermes layout. Keeps the literal defaults in one
+    place so operators can extend them without re-reading the scanner
+    internals.
+
+    Path resolution rules:
+    - ``~/.hermes/profiles/`` and ``~/.hermes/profiles/default/`` are
+      derived from ``get_hermes_home().parent / "profiles"`` so the
+      scanner looks at the all-profiles dir regardless of the active
+      profile. This is the directory that holds ``secrets.enc.yaml`` for
+      every profile, plus the SOUL.md / agent files the worker may
+      have edited.
+    - ``~/.hermes/hermes-agent/`` is derived from ``Path(__file__).parent.parent``
+      — the repo root of the running hermes-agent checkout. Workers
+      (especially sund) commonly patch source files in place; the
+      scanner's job is to find those uncommitted edits.
+    - The ``davinci`` and ``dabu`` zones are absolute paths into the
+      vault. They are project-specific and live in the dict literally;
+      we deliberately do not parameterize them by HOME so the scanner
+      has the same behavior whether or not the worker is running
+      under a profile-scoped home.
+    """
+    # Lazy import to avoid a circular import at module load.
+    from hermes_constants import get_hermes_home
+    hermes_root = Path(get_hermes_home())  # e.g. /home/moikapy/.hermes
+    profiles_root = hermes_root / "profiles"
+    # Repo root of the running hermes-agent checkout. kanban_db.py lives
+    # at <repo>/hermes_cli/kanban_db.py, so .parent.parent is the repo.
+    repo_root = Path(__file__).resolve().parent.parent
+    return {
+        "davinci": [
+            "/mnt/5tb/.korvax/notes/Research/",
+            "/mnt/5tb/.korvax/notes/Retros/",
+            "/mnt/5tb/.korvax/notes/Decisions/",
+        ],
+        "sund": [
+            str(profiles_root) + "/",
+            str(repo_root) + "/",
+        ],
+        "default": [
+            str(profiles_root / "default") + "/",
+        ],
+        "dabu": [
+            "/mnt/5tb/.korvax/06-GENERATED/",
+            "/mnt/5tb/.korvax/02-AREAS/Content-Forge-and-Media/",
+        ],
+    }
+
+
+# Ambient write zones — directories outside the task workspace where a
+# worker is likely to deposit its deliverable, keyed by assignee profile.
+# The auto-recovery scanner consults these only when the in-workspace
+# rglob returns no candidates, so a worker that writes the file to its
+# "natural home" (sund → source tree / profile dir, davinci → vault
+# research dirs) is still recovered cleanly instead of tripping a false
+# ``protocol_violation`` alert. See task t_9a81dc4a for the diagnostic
+# that motivated this list and the rollout plan for adding more zones.
+#
+# Resolved lazily on first access (NOT at module load) so the scanner
+# picks up the active ``HERMES_HOME`` and the running hermes-agent repo
+# root. This matters because (a) tests monkeypatch ``HERMES_HOME`` to a
+# tmp dir, and (b) the dispatcher runs workers under profile-scoped
+# homes, so deferring resolution lets both contexts use the right base.
+AMBIENT_ZONES: dict[str, list[str]] = {}  # populated by _get_ambient_zones()
+
+
+def _get_ambient_zones() -> dict[str, list[str]]:
+    global AMBIENT_ZONES
+    if not AMBIENT_ZONES:
+        AMBIENT_ZONES = _build_ambient_zones()
+    return AMBIENT_ZONES
+
+
+def _scan_zone_for_deliverable(
+    zone: Path, started_at: float, min_size: int = 100,
+) -> Optional[Path]:
+    """Return the most-recently-modified file under ``zone`` that was
+    modified after ``started_at`` and is at least ``min_size`` bytes,
+    or ``None`` if no such file exists.
+
+    Mirrors the in-workspace scanner's mtime + size filters. Symmetric
+    with the existing rglob: returns the freshest qualifying file, which
+    is the worker's "natural" deliverable. Returns ``None`` for any
+    OSError (missing dir, permission, etc.) so the caller can fall
+    through to the next zone without raising.
+    """
+    if not zone.is_dir():
+        return None
+    try:
+        candidates: list[tuple[float, Path, int]] = []
+        for entry in zone.rglob("*"):
+            if not entry.is_file():
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if st.st_size < min_size:
+                continue
+            if st.st_mtime < float(started_at):
+                continue
+            candidates.append((st.st_mtime, entry, st.st_size))
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _try_soft_complete_from_workspace(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    pid: int,
+    exit_code: int,
+) -> Optional[str]:
+    """Auto-complete a task whose worker exited cleanly without calling
+    ``kanban_complete``, when the workspace has a plausible deliverable.
+
+    Returns the task id if soft-completed, ``None`` otherwise. The caller
+    is responsible for the surrounding ``write_txn``.
+
+    This is the recovery path for the recurring "davinci research wrote
+    the plan then exited without calling kanban_complete" pattern. Without
+    it, the operator gets a noisy Discord protocol_violation alert every
+    time a worker forgets the exit protocol, even though the work is done.
+
+    Soft-complete criteria (ALL must hold):
+      1. The task has a ``workspace_path`` that exists on disk
+      2. The workspace contains at least one non-empty file
+      3. That file was modified during the worker's run (i.e. its mtime
+         is more recent than the task's ``started_at``)
+      4. The file is at least 100 bytes (filters out accidental empty
+         placeholder writes)
+
+    If the in-workspace scan returns no candidates, the scanner falls
+    through to the assignee's ``AMBIENT_ZONES`` (sund's source tree,
+    davinci's vault research dirs, etc.) using the same mtime + size
+    criteria. This closes the false-crash pattern where workers
+    (correctly) ship work to a "natural home" outside their scratch
+    workspace and exit without calling ``kanban_complete``.
+
+    The function picks the most-recently-modified qualifying file as
+    ``the deliverable``, sets ``tasks.result`` to its absolute path with
+    a one-line auto-generated summary, ends the run as ``completed``, and
+    appends a ``completed`` event so the normal notifier path delivers a
+    clean `✔ done` alert to Discord.
+
+    Workers are still expected to call ``kanban_complete`` themselves
+    — this is a safety net, not a replacement. The kanban-worker skill
+    now documents the protocol as a hard requirement.
+    """
+    task_id = row["id"]
+    workspace = (row["workspace_path"] or "").strip()
+    started_at = row["started_at"] if "started_at" in row.keys() else None
+    if started_at is None:
+        # Without started_at we can't bound the search; bail.
+        return None
+    # First pass: the task's own workspace. Same behavior as before the
+    # ambient-zone extension — in-workspace rglob with mtime + size
+    # filters, most-recently-modified wins.
+    deliverable: Optional[Path] = None
+    size: int = 0
+    zone_label: str = ""
+    zone_root: Optional[Path] = None
+    if workspace:
+        workspace_p = Path(workspace)
+        if workspace_p.is_dir():
+            try:
+                candidates: list[tuple[float, Path, int]] = []
+                for entry in workspace_p.rglob("*"):
+                    if not entry.is_file():
+                        continue
+                    try:
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    if st.st_size < 100:
+                        continue
+                    if st.st_mtime < float(started_at):
+                        continue
+                    candidates.append((st.st_mtime, entry, st.st_size))
+            except OSError:
+                candidates = []
+            if candidates:
+                candidates.sort(reverse=True)
+                _, deliverable, size = candidates[0]
+                zone_label = "workspace"
+                zone_root = workspace_p
+    # Second pass: ambient zones for the assignee profile. Only reached
+    # if the in-workspace scan came up empty. The profile name is taken
+    # from the task row (already on hand) so the lookup is symmetric
+    # with the workspace path and doesn't require a new argument.
+    # ``~`` expansion happens at call time so the scanner picks up the
+    # active ``Path.home()`` (tests monkeypatch it; production runs
+    # under profile-scoped homes).
+    if deliverable is None:
+        assignee = (row["assignee"] or "").strip()
+        zones = _get_ambient_zones().get(assignee, ())
+        for zone_str in zones:
+            zone = Path(zone_str)
+            found = _scan_zone_for_deliverable(zone, started_at)
+            if found is not None:
+                deliverable = found
+                size = found.stat().st_size
+                zone_label = f"ambient:{assignee}"
+                zone_root = zone
+                break
+    if deliverable is None or zone_root is None:
+        return None
+    try:
+        deliverable_rel = str(deliverable.relative_to(zone_root))
+    except ValueError:
+        deliverable_rel = str(deliverable)
+    summary = (
+        f"auto-recovered: worker exited cleanly (rc={exit_code}) without "
+        f"calling kanban_complete; deliverable detected on disk "
+        f"({zone_label}): {deliverable_rel} ({size} bytes)"
+    )
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'done', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL, completed_at = ?, "
+        "result = ? WHERE id = ? AND status = 'running'",
+        (int(time.time()), f"deliverable: {deliverable}\n\n{summary}", task_id),
+    )
+    if cur.rowcount != 1:
+        # Another actor (concurrent dispatch tick) already moved it.
+        return None
+    run_id = _end_run(
+        conn, task_id,
+        outcome="completed", status="completed",
+        error=None,
+        metadata={
+            "deliverable": str(deliverable),
+            "deliverable_rel": deliverable_rel,
+            "deliverable_size": size,
+            "auto_recovered": True,
+            "auto_recovered_reason": "clean_exit_no_complete_but_deliverable_on_disk",
+            "auto_recovered_zone": zone_label,
+            "pid": pid,
+            "exit_code": exit_code,
+        },
+    )
+    _append_event(
+        conn, task_id, "completed",
+        {
+            "summary": summary,
+            "deliverable": str(deliverable),
+            "auto_recovered": True,
+            "auto_recovered_zone": zone_label,
+        },
+        run_id=run_id,
+    )
+    return task_id
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -5476,8 +5830,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT id, worker_pid, claim_lock, started_at, workspace_path, "
+            "assignee "
+            "FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -5499,12 +5854,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            protocol_violation = False  # only True on true clean-exit-no-complete
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Retrying won't
                 # help.
-                protocol_violation = True
+                #
+                # RECOVERY: before declaring a protocol violation, scan
+                # the workspace for a recent non-empty file. Workers
+                # commonly write the deliverable to disk and then exit
+                # without calling kanban_complete (e.g. davinci research
+                # tasks, sund kanban babysitting). If we find a plausible
+                # deliverable, soft-complete the task with the file path
+                # as the result. This eliminates false-positive Discord
+                # alerts and keeps the operator from having to recover
+                # tasks by hand.
+                soft = _try_soft_complete_from_workspace(
+                    conn, row, pid, code,
+                )
+                if soft is not None:
+                    # Soft-completed; don't fall through to the crash path.
+                    # The completion event will be delivered to subscribers
+                    # by the normal notifier path.
+                    continue
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
                     "kanban_complete or kanban_block — protocol violation"

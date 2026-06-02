@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import threading
+import re
+import time
 from pathlib import Path
 
 import pytest
@@ -566,3 +568,149 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# SLA badge (per t_d4fd455d)
+# ---------------------------------------------------------------------------
+
+def _backdate_task(tid: str, days_ago: float) -> None:
+    """Helper: set a task's created_at to N days in the past so SLA logic
+    fires predictably. Direct UPDATE — the create_task API doesn't take a
+    created_at kwarg."""
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (int(time.time()) - int(days_ago * 86400), tid),
+        )
+
+
+def test_kanban_list_shows_overdue_badge_for_past_sla_task(kanban_home):
+    """Acceptance: `hermes kanban list` shows '🚨 3d overdue' for past-SLA
+    tasks. Backdates a p=3 task 10 days (3 days past its 7-day SLA)."""
+    out = kc.run_slash("create 'old p3' --assignee alice --priority 3")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    _backdate_task(tid, 10)
+
+    rendered = kc.run_slash("list")
+
+    assert "old p3" in rendered
+    assert "🚨 3d overdue" in rendered
+
+
+def test_kanban_list_hides_badge_for_fresh_task(kanban_home):
+    """A task created moments ago is not overdue. The SLA module would
+    render '⏰ 14d' (or similar) for in-budget tasks, but the CLI gates that
+    out so a brand-new board doesn't get a wall of badges — only the
+    actionable 🚨 marker ships by default."""
+    kc.run_slash("create 'brand new' --assignee alice --priority 3")
+
+    rendered = kc.run_slash("list")
+
+    assert "brand new" in rendered
+    # Either no badge at all, or "⏰ Nd" with N > 0 — never 🚨
+    assert "🚨" not in rendered.split("brand new")[1].splitlines()[0]
+
+
+def test_kanban_list_json_exposes_sla_fields(kanban_home):
+    """JSON consumers (Scarf, web dashboards) get the SLA fields directly
+    so they don't have to re-derive them from priority+created_at."""
+    out = kc.run_slash("create 'sla json' --assignee alice --priority 3")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    _backdate_task(tid, 10)
+
+    payload = json.loads(kc.run_slash("list --json"))
+    row = next(r for r in payload if r["id"] == tid)
+    assert row["sla_days_remaining"] == -3
+    assert row["sla_overdue"] is True
+    assert row["sla_deadline"] is not None
+
+
+# ---------------------------------------------------------------------------
+# `kanban sla` subcommand (per t_d4fd455d)
+# ---------------------------------------------------------------------------
+
+def test_kanban_sla_prints_only_overdue(kanban_home):
+    """`hermes kanban sla` shows only past-SLA tasks. Fresh tasks must
+    not appear; the most-overdue task must come first."""
+    fresh = kc.run_slash("create 'fresh' --assignee alice --priority 3")
+    overdue_3d = kc.run_slash("create 'overdue 3d' --assignee alice --priority 3")
+    overdue_8d = kc.run_slash("create 'overdue 8d' --assignee alice --priority 4")
+    _backdate_task(re.search(r"(t_[a-f0-9]+)", fresh).group(1), 1)
+    _backdate_task(re.search(r"(t_[a-f0-9]+)", overdue_3d).group(1), 10)  # 3d past 7d SLA
+    _backdate_task(re.search(r"(t_[a-f0-9]+)", overdue_8d).group(1), 11)  # 8d past 3d SLA
+
+    out = kc.run_slash("sla")
+
+    assert "fresh" not in out
+    assert "overdue 3d" in out
+    assert "overdue 8d" in out
+    assert "🚨" in out
+    # Most overdue (8d) should appear before the 3d one.
+    assert out.index("overdue 8d") < out.index("overdue 3d")
+
+
+def test_kanban_sla_empty_prints_cheerful_message(kanban_home):
+    """No overdue tasks → short positive confirmation, not a stack trace."""
+    kc.run_slash("create 'fresh' --assignee alice --priority 3")
+
+    out = kc.run_slash("sla")
+
+    assert "No tasks past" in out or "on pace" in out.lower()
+
+
+def test_kanban_sla_excludes_running_tasks(kanban_home):
+    """Per the brief-script convention: tasks that are actively running
+    are not 'overdue alarms' even if they slipped. A running 5-day-old
+    p=3 task would normally be 2 days past its 7-day SLA but should not
+    appear in the alarm list — somebody is on it."""
+    out = kc.run_slash("create 'on it' --assignee alice --priority 3")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    _backdate_task(tid, 10)
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+
+    sla_out = kc.run_slash("sla")
+
+    assert "on it" not in sla_out
+
+
+def test_kanban_sla_json_shape_matches_list(kanban_home):
+    """JSON output from `sla --json` should be a subset of `list --json`
+    with the same field names plus `sla_days_overdue` for convenience."""
+    out = kc.run_slash("create 'overdue' --assignee alice --priority 3")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    _backdate_task(tid, 12)  # 5d past 7d SLA
+
+    payload = json.loads(kc.run_slash("sla --json"))
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    row = payload[0]
+    assert row["id"] == tid
+    assert row["sla_days_overdue"] == 5
+    assert row["sla_overdue"] is True
+
+
+def test_kanban_sla_all_includes_done_and_archived(kanban_home):
+    """`--all` widens the view to include done/archived tasks — useful
+    for retrospective SLA audits."""
+    out = kc.run_slash("create 'done but late' --assignee alice --priority 3")
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    _backdate_task(tid, 10)
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+
+    default_out = kc.run_slash("sla")
+    all_out = kc.run_slash("sla --all")
+
+    assert "done but late" not in default_out
+    assert "done but late" in all_out
+
+
+def test_kanban_sla_subcommand_is_registered_in_command_registry():
+    """The Telegram/Discord autocomplete needs to know about `sla` so
+    users can tab-complete it. The subcommands list on the `kanban`
+    CommandDef is the single source of truth."""
+    from hermes_cli.commands import SUBCOMMANDS
+
+    assert "sla" in SUBCOMMANDS["/kanban"]

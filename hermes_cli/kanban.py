@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -26,6 +27,12 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_sla import (
+    PRIORITY_SLA_DAYS,
+    is_overdue as _sla_is_overdue,
+    sla_badge as _sla_badge_str,
+    sla_deadline as _sla_deadline,
+)
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
 
@@ -50,15 +57,39 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, sla_badge: str = "") -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    badge = f"  {sla_badge}" if sla_badge else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{badge}"
+
+
+def _sla_badge_for_task(t: kb.Task, now: Optional[int] = None) -> str:
+    """Return the inline SLO badge for *t* (e.g. ``'🚨 3d overdue'``).
+
+    Returns the empty string when the task has no created_at (defensive — the
+    DB schema marks it NOT NULL but a corrupt row shouldn't crash the CLI) or
+    when the computed badge would be redundant noise (priority not in the SLA
+    table and we'd render ``⏰ 14d`` for every task — skip it in that case).
+    """
+    if not t.created_at:
+        return ""
+    now = now if now is not None else int(time.time())
+    try:
+        deadline, remaining = _sla_deadline(t.created_at, t.priority or 0, now)
+    except Exception:
+        return ""
+    # Skip the OK-state badge for tasks with no defined SLA so a brand-new
+    # board doesn't get a wall of "⏰ 14d" on every line. Only show the
+    # overdue marker — that's the actionable signal the user actually wants.
+    if remaining >= 0 and t.priority not in PRIORITY_SLA_DAYS:
+        return ""
+    return _sla_badge_str(deadline, remaining)
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    return {
+    d = {
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -80,6 +111,18 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+    # Surface the SLA fields so JSON consumers (Scarf, web dashboards) can
+    # show overdue markers without re-implementing the priority→days math.
+    try:
+        deadline, remaining = _sla_deadline(t.created_at or 0, t.priority or 0, int(time.time()))
+        d["sla_deadline"] = deadline
+        d["sla_days_remaining"] = remaining
+        d["sla_overdue"] = _sla_is_overdue(deadline, remaining)
+    except Exception:
+        d["sla_deadline"] = None
+        d["sla_days_remaining"] = None
+        d["sla_overdue"] = None
+    return d
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -129,6 +172,145 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     if any(ch.isspace() for ch in branch):
         raise argparse.ArgumentTypeError("--branch must not contain whitespace")
     return branch
+
+
+# ---------------------------------------------------------------------------
+# Type / assignee validation (division-of-labor enforcement)
+# ---------------------------------------------------------------------------
+#
+# When a task body declares **Type:** <X>, that type is the canonical owner
+# per the ``division-of-labor`` skill.  Cross-referencing the assignee against
+# the declared type catches two recurring failure modes:
+#
+#  1. ``hermes kanban create`` lands with the wrong assignee (operator error
+#     or stale muscle memory) and the dispatcher spawns a profile that
+#     self-routes back, burning iterations.
+#  2. ``hermes kanban migrate-assignee`` rewrites tasks to a profile that
+#     isn't the type's owner (e.g. a post-rotation bulk rewrite moves
+#     ``sund`` coding tasks to ``davinci``, which is research-only).
+#
+# The check is advisory by default — many tasks are legitimately
+# cross-cutting (a config task may need davinci to verify research
+# correctness), so a hard error would create friction.  Pass ``--strict``
+# to opt into the hard-error behavior.
+
+# Canonical owner per task type, sourced from the ``division-of-labor`` skill
+# (verified 2026-06-01, post-rotation).  Profile names are stored exactly as
+# they appear in the on-disk profile directories at ``~/.hermes/profiles/``
+# (the dispatcher's spawn check is case-sensitive).  When a type doesn't have
+# a single owner (e.g. ``creation`` can be coding or visual), use ``None`` to
+# skip the check entirely — that type accepts any assignee.
+TASK_TYPE_ASSIGNEE_MATRIX: dict[str, Optional[str]] = {
+    "coding":          "sund",         # writes/modifies source code
+    "config":          "sund",         # YAML, .env, .bashrc, cron, systemd
+    "research":        "davinci",      # read-only investigation, briefs
+    "verification":    "sund",         # run scripts, check files, smoke tests
+    "design-decision": "orchestrator", # needs PM-level cross-system context
+    "habit":           "sund",         # recurring scripts/aliases
+    "creation":        None,           # new project scaffolding — owner varies
+    "visual":          "dabu",         # image/video/VHS post-process
+}
+
+# Matches the canonical ``**Type:** <value>`` header with three tolerated
+# separator layouts (close-bold-colon, plain colon, open-bold-colon) and
+# optional leading/trailing whitespace, bold stars, and inline whitespace.
+# Tolerant enough to accept all observed operator-written variants without
+# trying to be a full markdown parser.  ``re.IGNORECASE`` is applied at
+# match time so the Type word is case-insensitive (``TYPE``, ``Type``,
+# ``type`` all match).
+#
+# Examples that match (captured value shown in parens):
+#   **Type:** coding                              → (coding)
+#   **Type: research**                            → (research)
+#   **Type**:   design-decision                   → (design-decision)
+#   **Type:foo**                                  → (foo)
+#   Goal: ...\n**Type:** coding                   → (coding)  (non-first-line)
+#
+# Examples that DON'T match (intentional — the value must end the line):
+#   **Type:** coding and stuff                    (extra prose after value)
+#   **Type:** coding.                             (trailing punctuation)
+#   **Type: **coding**                            (value wrapped in bold)
+_TYPE_SEP = r"(?::\*\*\s*|:\s*|\*\*\s*:\s*)"
+_TYPE_LINE_RE = re.compile(
+    r"^[^\S\n]*\*\*[^\S\n]*"
+    r"[Tt]ype"
+    r"[^\S\n]*" + _TYPE_SEP +
+    r"([A-Za-z][\w-]*)"
+    r"[^\S\n]*\*?\*?"
+    r"[^\S\n]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def parse_task_type(body: Optional[str]) -> Optional[str]:
+    """Return the task-type string declared in the first ``**Type:**`` line of *body*, or ``None``.
+
+    The match is intentionally tolerant: accepts ``**Type:** coding``,
+    ``**Type: coding**``, ``**Type**: coding``, and leading whitespace.
+    Returns ``None`` when the body is empty or the first ``**Type:**`` line
+    is missing — those tasks opt out of the type-check by design.
+
+    Operator-written bodies sometimes pass a literal two-char ``\\n``
+    escape as the line terminator (the ``--body`` arg is single-quoted
+    through shlex, so bash never interprets the escape).  We normalize
+    those to real newlines before matching — keeps the regex simple and
+    preserves the original strict end-of-line semantics (no ``coding.``
+    or ``coding and stuff`` false-matches).
+    """
+    if not body:
+        return None
+    # Normalize literal ``\n`` (two chars) → real newline.  Cheap because
+    # bodies are short (the test harness sees a few hundred chars at most).
+    normalized = body.replace("\\n", "\n")
+    m = _TYPE_LINE_RE.search(normalized)
+    if not m:
+        return None
+    return m.group(1).strip().lower() or None
+
+
+def check_assignee_matches_type(
+    assignee: Optional[str],
+    body: Optional[str],
+    *,
+    strict: bool = False,
+) -> Optional[str]:
+    """Cross-check *assignee* against the type declared in *body*.
+
+    Returns a human-readable warning string when the assignee does not
+    match the canonical owner for the declared type, or ``None`` when the
+    check passes / is not applicable (no type declared, type has no
+    canonical owner, or assignee is unassigned).
+
+    When *strict* is true, a mismatch raises :class:`ValueError` with the
+    same message — the caller catches it and exits non-zero.  In non-strict
+    mode the function never raises; the CLI prints the warning and proceeds.
+    """
+    if not assignee:
+        # Unassigned tasks are opt-out of the cross-check — operators may
+        # park a task in a profile-agnostic way (e.g. triage, decomposed
+        # sub-tasks waiting for routing).
+        return None
+    task_type = parse_task_type(body)
+    if task_type is None:
+        # No declared type → opt out of the check.
+        return None
+    expected = TASK_TYPE_ASSIGNEE_MATRIX.get(task_type)
+    if expected is None:
+        # Type has no canonical owner (e.g. ``creation``) → opt out.
+        return None
+    if assignee == expected:
+        return None
+    msg = (
+        f"type '{task_type}' is owned by '{expected}' per the "
+        f"division-of-labor skill, but assignee is '{assignee}'. "
+        f"Common causes: profile rotation drift, bulk migrate-assignee "
+        f"re-targeting the wrong lane, or a copy-pasted body from a "
+        f"previous task. Reassign with `hermes kanban reassign <id> "
+        f"{expected}` or pass --strict on create to block this early."
+    )
+    if strict:
+        raise ValueError(msg)
+    return msg
 
 
 def _check_dispatcher_presence() -> tuple[bool, str]:
@@ -361,6 +543,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--strict", action="store_true",
+                          dest="strict_type_check",
+                          help="Hard-error when --assignee does not match the "
+                               "canonical owner for the body's **Type:** "
+                               "(per the division-of-labor matrix). Default "
+                               "is to warn and proceed. See the "
+                               "division-of-labor skill for the mapping.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -418,6 +607,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restrict to tasks with this current_step_key",
     )
 
+    # --- sla (overdue-only view, shares the badge logic with `list`) ---
+    p_sla = sub.add_parser(
+        "sla",
+        help="Show only tasks past their priority-based SLA (🚨 overdue)",
+    )
+    p_sla.add_argument("--mine", action="store_true",
+                       help="Filter by $HERMES_PROFILE as assignee")
+    p_sla.add_argument("--assignee", default=None)
+    p_sla.add_argument("--tenant", default=None)
+    p_sla.add_argument("--json", action="store_true")
+    p_sla.add_argument(
+        "--all",
+        action="store_true",
+        dest="include_all",
+        help="Include done / archived tasks (default: only open work)",
+    )
+
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
@@ -467,6 +673,57 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reassign.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+    p_reassign.add_argument(
+        "--strict", action="store_true",
+        dest="strict_type_check",
+        help="Hard-error when the new profile does not match the canonical "
+             "owner for the task's **Type:** (per the division-of-labor "
+             "matrix). Default is to warn and proceed.",
+    )
+
+    # --- migrate-assignee: bulk-rewrite assignee after profile rotation ---
+    p_migrate = sub.add_parser(
+        "migrate-assignee",
+        aliases=["migrate_assignee"],
+        help="Bulk-rewrite tasks from one assignee to another (post-rotation recovery)",
+    )
+    p_migrate.add_argument("old_assignee", help="Current (stale) assignee to migrate away from")
+    p_migrate.add_argument(
+        "new_assignee",
+        help="New assignee (or 'none' to unassign)",
+    )
+    p_migrate.add_argument(
+        "--include-archived", action="store_true",
+        help="Also rewrite assignee on archived tasks (default: skip)",
+    )
+    p_migrate.add_argument(
+        "--include-done", action="store_true",
+        help="Also rewrite assignee on done tasks (default: skip — history is preserved)",
+    )
+    p_migrate.add_argument(
+        "--include-running", action="store_true",
+        help=(
+            "Include running tasks in the migration. By default the safety "
+            "guard skips rows with an active claim; with this flag the rows "
+            "are updated anyway (use only after reclaiming the worker)."
+        ),
+    )
+    p_migrate.add_argument(
+        "--reason", default=None,
+        help="Human-readable reason recorded on each emitted 'migrated' event",
+    )
+    p_migrate.add_argument(
+        "--strict", action="store_true",
+        dest="strict_type_check",
+        help="Hard-error when the destination assignee does not match the "
+             "canonical owner for any migrated task's **Type:** (per the "
+             "division-of-labor matrix). Default is to warn and proceed "
+             "— operators need to see ALL warnings to catch rotation bugs.",
+    )
+    p_migrate.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON instead of the human summary",
     )
 
     # --- diagnostics (board-wide health) ---
@@ -835,6 +1092,53 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- brief --- (on-demand board brief; wraps ~/.hermes/scripts/morning_brief.py)
+    p_brief = sub.add_parser(
+        "brief",
+        help="Generate the board brief on-demand (wraps morning_brief.py)",
+        description=(
+            "Generate the daily board brief on-demand for any time window. "
+            "This is a thin wrapper around ~/.hermes/scripts/morning_brief.py — "
+            "the daily 6 AM cron uses the same script. By default writes the "
+            "brief to 06-GENERATED/Briefs/; pass --dry-run to stream to stdout.\n\n"
+            "Examples:\n"
+            "  hermes kanban brief                       # today's brief (writes to vault)\n"
+            "  hermes kanban brief --dry-run             # print to stdout, don't write\n"
+            "  hermes kanban brief --window 4h --dry-run # last 4 hours, stdout\n"
+            "  hermes kanban brief --date 2026-06-01     # brief for a specific day\n"
+            "  hermes kanban brief --window 7d           # weekly rollup\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_brief.add_argument(
+        "--date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Override the brief date (ISO format, for testing/back-fill). "
+             "Default: today.",
+    )
+    p_brief.add_argument(
+        "--window",
+        default=None,
+        metavar="<duration>",
+        help="Size of the 'yesterday' window: s/m/h/d suffix (e.g. 4h, 7d, 30m) "
+             "or bare seconds. Default: 24h. Affects the wins/starts/new-tasks "
+             "sections; queue/overdue/blocked/tomorrow-plan are point-in-time.",
+    )
+    p_brief.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the brief to stdout instead of writing to "
+             "06-GENERATED/Briefs/.",
+    )
+    p_brief.add_argument(
+        "--script",
+        default=None,
+        metavar="<path>",
+        help="Override the morning_brief.py path (default: "
+             "~/.hermes/scripts/morning_brief.py). Useful for testing.",
+    )
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -920,56 +1224,62 @@ def kanban_command(args: argparse.Namespace) -> int:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
 
-        handlers = {
-            "init":     _cmd_init,
-            "create":   _cmd_create,
-            "swarm":    _cmd_swarm,
-            "list":     _cmd_list,
-            "ls":       _cmd_list,
-            "show":     _cmd_show,
-            "assign":   _cmd_assign,
-            "reclaim":  _cmd_reclaim,
-            "reassign": _cmd_reassign,
-            "diagnostics": _cmd_diagnostics,
-            "diag":     _cmd_diagnostics,
-            "link":     _cmd_link,
-            "unlink":   _cmd_unlink,
-            "claim":    _cmd_claim,
-            "comment":  _cmd_comment,
-            "complete": _cmd_complete,
-            "edit":     _cmd_edit,
-            "block":    _cmd_block,
-            "schedule": _cmd_schedule,
-            "unblock":  _cmd_unblock,
-            "promote":  _cmd_promote,
-            "archive":  _cmd_archive,
-            "tail":     _cmd_tail,
-            "dispatch": _cmd_dispatch,
-            "daemon":   _cmd_daemon,
-            "watch":    _cmd_watch,
-            "stats":    _cmd_stats,
-            "log":      _cmd_log,
-            "runs":     _cmd_runs,
-            "heartbeat": _cmd_heartbeat,
-            "assignees": _cmd_assignees,
-            "notify-subscribe":   _cmd_notify_subscribe,
-            "notify-list":        _cmd_notify_list,
-            "notify-unsubscribe": _cmd_notify_unsubscribe,
-            "context":  _cmd_context,
-            "specify":  _cmd_specify,
-            "decompose":  _cmd_decompose,
-            "gc":       _cmd_gc,
-        }
-        handler = handlers.get(action)
-        if not handler:
-            print(f"kanban: unknown action {action!r}", file=sys.stderr)
-            return 2
-        try:
-            return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
-            print(f"kanban: {exc}", file=sys.stderr)
-            return 1
-
+    handlers = {
+        "init":     _cmd_init,
+        "create":   _cmd_create,
+        "swarm":    _cmd_swarm,
+        "list":     _cmd_list,
+        "ls":       _cmd_list,
+        "sla":      _cmd_sla,
+        "show":     _cmd_show,
+        "assign":   _cmd_assign,
+        "reclaim":  _cmd_reclaim,
+        "reassign": _cmd_reassign,
+        "migrate-assignee": _cmd_migrate_assignee,
+        "diagnostics": _cmd_diagnostics,
+        "diag":     _cmd_diagnostics,
+        "link":     _cmd_link,
+        "unlink":   _cmd_unlink,
+        "claim":    _cmd_claim,
+        "comment":  _cmd_comment,
+        "complete": _cmd_complete,
+        "edit":     _cmd_edit,
+        "block":    _cmd_block,
+        "schedule": _cmd_schedule,
+        "unblock":  _cmd_unblock,
+        "promote":  _cmd_promote,
+        "archive":  _cmd_archive,
+        "tail":     _cmd_tail,
+        "dispatch": _cmd_dispatch,
+        "daemon":   _cmd_daemon,
+        "watch":    _cmd_watch,
+        "stats":    _cmd_stats,
+        "log":      _cmd_log,
+        "runs":     _cmd_runs,
+        "heartbeat": _cmd_heartbeat,
+        "assignees": _cmd_assignees,
+        "notify-subscribe":   _cmd_notify_subscribe,
+        "notify-list":        _cmd_notify_list,
+        "notify-unsubscribe": _cmd_notify_unsubscribe,
+        "context":  _cmd_context,
+        "specify":  _cmd_specify,
+        "decompose":  _cmd_decompose,
+        "brief":    _cmd_brief,
+        "gc":       _cmd_gc,
+    }
+    handler = handlers.get(action)
+    if not handler:
+        print(f"kanban: unknown action {action!r}", file=sys.stderr)
+        _restore_board_env()
+        return 2
+    try:
+        return int(handler(args) or 0)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        _restore_board_env()
+        return 1
+    finally:
+        _restore_board_env()
 
 # ---------------------------------------------------------------------------
 # Handlers
@@ -1325,6 +1635,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Cross-check the assignee against the body's **Type:** per the
+    # division-of-labor matrix. --strict turns the advisory warning into
+    # a hard error that blocks creation. In warning mode we always print
+    # the message to stderr and proceed (the operator may have a reason).
+    try:
+        warning = check_assignee_matches_type(
+            getattr(args, "assignee", None),
+            getattr(args, "body", None),
+            strict=bool(getattr(args, "strict_type_check", False)),
+        )
+    except ValueError as exc:
+        # --strict mismatch: surface as a usage-style error and abort.
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if warning is not None:
+        print(f"⚠ {warning}", file=sys.stderr)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1438,8 +1764,80 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    now = int(time.time())
     for t in tasks:
-        print(_fmt_task_line(t))
+        print(_fmt_task_line(t, _sla_badge_for_task(t, now)))
+    return 0
+
+
+def _cmd_sla(args: argparse.Namespace) -> int:
+    """Print (or JSON-dump) only the tasks past their priority-based SLA.
+
+    Mirrors the `Overdue / At-Risk` section of the morning brief: ready/todo/
+    blocked/archived tasks whose ``created_at + sla_days(priority) < now`` are
+    listed, most-overdue first. Running tasks are excluded — if someone's
+    actively working on it, raising the alarm helps nobody (the brief script
+    follows the same convention).
+    """
+    assignee = args.assignee
+    if args.mine and not assignee:
+        assignee = _profile_author()
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        kb.recompute_ready(conn)
+        # Pull a superset of what `list` would show — we filter by status
+        # after the SLA check so we can drop running tasks cleanly.
+        if args.include_all:
+            tasks = kb.list_tasks(
+                conn,
+                assignee=assignee,
+                tenant=args.tenant,
+                include_archived=True,
+            )
+        else:
+            tasks = kb.list_tasks(
+                conn,
+                assignee=assignee,
+                tenant=args.tenant,
+            )
+            # `list` returns ready/todo/blocked/running by default; drop
+            # running here (the brief script follows the same rule).
+            open_set = {"ready", "todo", "blocked", "scheduled"}
+            tasks = [t for t in tasks if t.status in open_set]
+
+    overdue: list[tuple[kb.Task, int]] = []
+    for t in tasks:
+        if not t.created_at:
+            continue
+        deadline, remaining = _sla_deadline(t.created_at, t.priority or 0, now)
+        if _sla_is_overdue(deadline, remaining):
+            overdue.append((t, remaining))
+
+    if getattr(args, "json", False):
+        # Emit the same shape as `list --json` so consumers can swap the
+        # subcommand without changing their parser.
+        enriched = []
+        for t, remaining in overdue:
+            d = _task_to_dict(t)
+            d["sla_days_overdue"] = abs(remaining)
+            enriched.append(d)
+        print(json.dumps(enriched, indent=2, ensure_ascii=False))
+        return 0
+
+    if not overdue:
+        print("🚦 No tasks past their priority-based SLA. Team is on pace.")
+        return 0
+
+    # Most overdue first so the eye lands on the worst offenders.
+    overdue.sort(key=lambda pair: pair[1])
+    print(
+        f"🚨 {len(overdue)} task(s) past SLA — most overdue first, "
+        f"filter: "
+        + (f"assignee={assignee!r}" if assignee else "all assignees")
+        + "\n"
+    )
+    for t, remaining in overdue:
+        print(_fmt_task_line(t, _sla_badge_str(0, remaining)))
     return 0
 
 
@@ -1644,6 +2042,27 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
+    # Cross-check the new profile against the task's **Type:** when the
+    # task is reachable. We read the body outside the reassign transaction
+    # because (a) reassign_task does its own txn and (b) the validation is
+    # advisory / pre-flight — the reassign is the source of truth for
+    # "did the row actually change", and skipping the check when the task
+    # is missing keeps the existing "unknown id" error path intact.
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        body = task.body if task is not None else None
+    if body is not None:
+        try:
+            warning = check_assignee_matches_type(
+                profile,
+                body,
+                strict=bool(getattr(args, "strict_type_check", False)),
+            )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        if warning is not None:
+            print(f"⚠ {warning}", file=sys.stderr)
     with kb.connect_closing() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
@@ -1662,6 +2081,145 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         f"{profile or '(unassigned)'}"
         + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
     )
+    return 0
+
+
+def _cmd_migrate_assignee(args: argparse.Namespace) -> int:
+    """``hermes kanban migrate-assignee <old> <new>`` — bulk migration helper.
+
+    Typical use is the post-rotation recovery path:
+    ``hermes kanban migrate-assignee sund davinci`` rewrites every
+    ready/todo/blocked task currently assigned to ``sund`` to ``davinci``
+    so the dispatcher picks them up under the new name.
+
+    Safety defaults:
+    - Skips rows with status='running' unless ``--include-running``.
+    - Skips rows with status='done' unless ``--include-done``.
+    - Skips rows with status='archived' unless ``--include-archived``.
+    - Emits one ``migrated`` event per updated row for audit.
+
+    Returns 0 on success, 1 if no tasks matched, 2 on argument error.
+    """
+    new_assignee = (
+        None if args.new_assignee.lower() in {"none", "-", "null", ""}
+        else args.new_assignee
+    )
+
+    statuses: list[str] = ["ready", "todo", "blocked"]
+    if getattr(args, "include_done", False):
+        statuses.append("done")
+    if getattr(args, "include_running", False):
+        statuses.append("running")
+    if getattr(args, "include_archived", False):
+        statuses.append("archived")
+
+    reason = getattr(args, "reason", None)
+
+    # Pre-flight validation: read every candidate task's body, then
+    # cross-check against the destination assignee.  In warning mode we
+    # collect all mismatches and print them in a single batch (operators
+    # need to see ALL of them to catch rotation bugs — the standard
+    # task spec says "Do NOT change kanban migrate-assignee to skip the
+    # warning even with --force").  In --strict mode the first mismatch
+    # aborts before any rows are written.
+    strict = bool(getattr(args, "strict_type_check", False))
+    validation_warnings: list[tuple[str, str]] = []  # (task_id, message)
+
+    with kb.connect_closing() as conn:
+        # Mirror the candidate selection kb.migrate_assignee uses so the
+        # validation set matches what would actually be rewritten. Skipping
+        # the running filter here is fine: those rows are reported in
+        # skipped_running anyway, and the validation only warns on rows
+        # that the migration is about to touch.
+        status_filter_sql = (
+            "status != 'archived'" if not getattr(args, "include_archived", False)
+            else "1=1"
+        )
+        candidate_rows = conn.execute(
+            f"SELECT id, body FROM tasks "
+            f"WHERE assignee = ? AND {status_filter_sql}",
+            (args.old_assignee,),
+        ).fetchall()
+        for row in candidate_rows:
+            tid = row["id"]
+            body = row["body"]
+            try:
+                warning = check_assignee_matches_type(
+                    new_assignee, body, strict=strict,
+                )
+            except ValueError as exc:
+                # --strict mode: short-circuit before any UPDATE.
+                print(f"kanban: {exc}", file=sys.stderr)
+                print(
+                    f"kanban: (offending task id={tid}; would have been "
+                    f"migrated from {args.old_assignee!r} to {new_assignee!r})",
+                    file=sys.stderr,
+                )
+                return 2
+            if warning is not None:
+                validation_warnings.append((tid, warning))
+
+    if validation_warnings:
+        # Print all warnings in one batch so operators can see the full
+        # picture of type mismatches. The standard "always show all
+        # warnings" rule applies even when --strict isn't passed.
+        print(
+            f"⚠ {len(validation_warnings)} task(s) have a type-mismatch "
+            f"with the destination assignee {new_assignee or '(unassigned)'} "
+            f"(per division-of-labor):",
+            file=sys.stderr,
+        )
+        for tid, msg in validation_warnings:
+            # One line per task: id + the actionable bit of the message.
+            print(f"  - {tid}: {msg}", file=sys.stderr)
+
+    with kb.connect_closing() as conn:
+        result = kb.migrate_assignee(
+            conn,
+            args.old_assignee,
+            new_assignee,
+            statuses=tuple(statuses),
+            include_archived=getattr(args, "include_archived", False),
+            reason=reason,
+        )
+
+    updated = result["updated"]
+    skipped_running = result["skipped_running"]
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {
+                "old_assignee": args.old_assignee,
+                "new_assignee": new_assignee,
+                "updated": updated,
+                "skipped_running": skipped_running,
+                "statuses": statuses,
+            },
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+
+    target = new_assignee or "(unassigned)"
+    if not updated and not skipped_running:
+        print(
+            f"No tasks matched assignee={args.old_assignee!r} with statuses "
+            f"{', '.join(statuses)}.",
+            file=sys.stderr,
+        )
+        return 1
+    if updated:
+        print(
+            f"Migrated {len(updated)} task(s) from {args.old_assignee!r} → "
+            f"{target!r}: {', '.join(updated)}"
+        )
+    if skipped_running:
+        print(
+            f"⚠ Skipped {len(skipped_running)} running task(s) "
+            f"(reclaim them first, then rerun with --include-running): "
+            f"{', '.join(skipped_running)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -2682,6 +3240,72 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     if not all_flag:
         return 0 if ok_count == 1 else 1
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_brief(args: argparse.Namespace) -> int:
+    """Thin wrapper around ``~/.hermes/scripts/morning_brief.py``.
+
+    Resolves the script (honoring ``--script`` and the ``HERMES_HOME`` env
+    var), shells out with the requested flags, and streams the script's
+    stdout to our stdout. Mirrors the same flags the script accepts
+    (``--date``, ``--window``, ``--dry-run``) so a user can copy a
+    working cron invocation into the CLI and vice versa.
+
+    Script resolution order:
+      1. ``--script <path>`` if provided
+      2. ``$HERMES_HOME/scripts/morning_brief.py`` (matches what the cron
+         scheduler uses, which runs from the root ``~/.hermes`` context)
+      3. ``~/.hermes/scripts/morning_brief.py`` as a last-resort fallback
+         so a profile-scoped ``HERMES_HOME`` (e.g. when run from the
+         ``sund`` profile shell) still finds the script.
+
+    This handler intentionally does NOT re-implement the brief logic —
+    any change to the brief should be made inside ``morning_brief.py``
+    and will then flow through to both the cron and this CLI.
+    """
+    import subprocess
+
+    if getattr(args, "script", None):
+        script_path = Path(args.script).expanduser()
+    else:
+        hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+        candidate = hermes_home / "scripts" / "morning_brief.py"
+        if not candidate.is_file():
+            # Fall back to the canonical root ~/.hermes in case HERMES_HOME
+            # was overridden to a profile directory by an outer shell.
+            # get_default_hermes_root() walks up from "<root>/profiles/<name>"
+            # to "<root>" so profile-isolated shells still find the script.
+            try:
+                from hermes_constants import get_default_hermes_root
+                root_candidate = get_default_hermes_root() / "scripts" / "morning_brief.py"
+            except Exception:
+                root_candidate = Path("/home/moikapy/.hermes") / "scripts" / "morning_brief.py"
+            if root_candidate.is_file():
+                candidate = root_candidate
+        script_path = candidate
+
+    if not script_path.is_file():
+        print(
+            f"kanban brief: script not found at {script_path}. "
+            f"Pass --script <path> to override, or install morning_brief.py "
+            f"into $HERMES_HOME/scripts/ (or ~/.hermes/scripts/).",
+            file=sys.stderr,
+        )
+        return 1
+
+    cmd: list[str] = [sys.executable, str(script_path)]
+    if getattr(args, "date", None):
+        cmd += ["--date", args.date]
+    if getattr(args, "window", None):
+        cmd += ["--window", args.window]
+    if getattr(args, "dry_run", False):
+        cmd += ["--dry-run"]
+
+    # Inherit the current process env so the script sees the same
+    # HERMES_KANBAN_DB / KORVAX_VAULT overrides the user has set for
+    # `hermes kanban <other>`. Avoid mutating os.environ ourselves.
+    proc = subprocess.run(cmd, env=os.environ.copy())
+    return int(proc.returncode)
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:

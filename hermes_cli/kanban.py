@@ -1270,16 +1270,12 @@ def kanban_command(args: argparse.Namespace) -> int:
     handler = handlers.get(action)
     if not handler:
         print(f"kanban: unknown action {action!r}", file=sys.stderr)
-        _restore_board_env()
         return 2
     try:
         return int(handler(args) or 0)
     except (ValueError, RuntimeError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
-        _restore_board_env()
         return 1
-    finally:
-        _restore_board_env()
 
 # ---------------------------------------------------------------------------
 # Handlers
